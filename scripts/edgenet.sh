@@ -40,16 +40,20 @@ esac
 CHAIN_HOME=$HOME/.$BINARY
 CONFIG_FOLDER=$CHAIN_HOME/config
 
-SNAPSHOT_FILE=$HOME/cache/snapshot.tar.lz4
-
 edit_client () {
     # Expose the rpc
     dasel put -t string -f $CONFIG_FOLDER/client.toml '.keyring-backend' -v "test"
     dasel put -t string -f $CONFIG_FOLDER/client.toml '.chain-id' -v $CHAIN_ID
 }
 
-# Clear home directory
-rm -rf $CHAIN_HOME/
+# Clear the CONTENTS of the home directory, not the directory itself.
+# docker-compose.yml bind-mounts a host directory at /${BINARY}/.${BINARY}/, which
+# is exactly CHAIN_HOME. A live mountpoint cannot be unlinked from inside the
+# container, so `rm -rf $CHAIN_HOME/` fails with EBUSY and set -e kills us.
+# -mindepth 1 picks up dotfiles and is a no-op on an empty directory; mkdir -p
+# covers the case where the mount is absent (e.g. running the image directly).
+mkdir -p "$CHAIN_HOME"
+find "$CHAIN_HOME" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
 echo "🧪 Creating home for $VALIDATOR_MONIKER"
 echo $VALIDATOR_MNEMONIC | $BINARY init $VALIDATOR_MONIKER --chain-id $CHAIN_ID --home $CHAIN_HOME --default-denom $DENOM --recover
@@ -68,12 +72,64 @@ echo $VALIDATOR_MNEMONIC | $BINARY keys add $VALIDATOR_MONIKER --keyring-backend
 
 VALIDATOR_ADDRESS=$($BINARY keys show -a $VALIDATOR_MONIKER --keyring-backend test --home $CHAIN_HOME)
 
-# Download latest snapshot if cache is empty
-if [ ! -f "$SNAPSHOT_FILE" ]; then
-  echo -e "\nCache is empty. Downloading latest snapshot..."
-  curl -L $SNAPSHOT_URL -o $SNAPSHOT_FILE
-  echo -e ✅ Snapshot downloaded successfully.
+# SNAPSHOT_URL is a metadata endpoint, not the archive itself. It answers with
+# JSON of the form {"height":25667070,"url":"https://.../lumen-1_25667070.tar.lz4",...}
+# and the archive lives at .url.
+echo "🔎 Resolving snapshot metadata from $SNAPSHOT_URL"
+if ! SNAPSHOT_META=$(curl -fsSL "$SNAPSHOT_URL"); then
+    echo "FATAL: could not fetch snapshot metadata from $SNAPSHOT_URL" >&2
+    exit 1
 fi
+
+# A wrong-but-live endpoint can answer 200 with an empty body, which curl -f
+# reports as success, so an exit code of 0 is not proof of a usable response.
+if [ -z "$SNAPSHOT_META" ]; then
+    echo "FATAL: snapshot metadata endpoint $SNAPSHOT_URL returned an empty body" >&2
+    exit 1
+fi
+
+if ! echo "$SNAPSHOT_META" | jq -e . >/dev/null 2>&1; then
+    echo "FATAL: snapshot metadata endpoint $SNAPSHOT_URL did not return JSON:" >&2
+    echo "$SNAPSHOT_META" >&2
+    exit 1
+fi
+
+SNAPSHOT_ARCHIVE_URL=$(echo "$SNAPSHOT_META" | jq -r '.url // empty')
+SNAPSHOT_HEIGHT=$(echo "$SNAPSHOT_META" | jq -r '.height // empty')
+
+if [ -z "$SNAPSHOT_ARCHIVE_URL" ]; then
+    echo "FATAL: snapshot metadata from $SNAPSHOT_URL has no .url field:" >&2
+    echo "$SNAPSHOT_META" >&2
+    exit 1
+fi
+
+# The height is the cache key, so a metadata endpoint pointing at a different
+# height cannot be served the previously cached archive. Without it every
+# snapshot would collide on one filename.
+if [ -z "$SNAPSHOT_HEIGHT" ]; then
+    echo "FATAL: snapshot metadata from $SNAPSHOT_URL has no .height field:" >&2
+    echo "$SNAPSHOT_META" >&2
+    exit 1
+fi
+
+SNAPSHOT_FILE=$HOME/cache/snapshot-$SNAPSHOT_HEIGHT.tar.lz4
+
+echo "📦 Snapshot at height $SNAPSHOT_HEIGHT: $SNAPSHOT_ARCHIVE_URL"
+
+# Download the snapshot if this height is not already cached
+if [ ! -f "$SNAPSHOT_FILE" ]; then
+  echo -e "\nCache is empty for height $SNAPSHOT_HEIGHT. Downloading snapshot..."
+  mkdir -p "$HOME/cache"
+  # Download to a temporary name and rename only on success, so an interrupted
+  # download is never mistaken for a complete cache entry on the next run.
+  curl -fL "$SNAPSHOT_ARCHIVE_URL" -o "$SNAPSHOT_FILE.part"
+  mv "$SNAPSHOT_FILE.part" "$SNAPSHOT_FILE"
+  echo -e ✅ Snapshot downloaded successfully.
+else
+  echo "✅ Snapshot for height $SNAPSHOT_HEIGHT already cached."
+fi
+
+echo "♻️  Restoring snapshot at height $SNAPSHOT_HEIGHT"
 
 lz4 -dc $SNAPSHOT_FILE | tar -C $CHAIN_HOME/ -xf -
 

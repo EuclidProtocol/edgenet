@@ -12,9 +12,33 @@ RUN apk add jq
 RUN apk add lz4
 
 # Download binary and config files
-RUN curl -L https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/${BINARY}_edgenet_${PLATFORM} -o /bin/${BINARY}
+# -f/--fail makes curl exit non-zero on an HTTP error instead of writing the
+# error page's body to disk; --retry only retries transient failures
+# (timeouts, 5xx) and never turns a 404 into a pass.
+RUN curl -fL --retry 3 --retry-delay 2 -o /bin/${BINARY} \
+      https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/${BINARY}_edgenet_${PLATFORM} \
+    || { echo "ERROR: failed to download binary artifact from https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/${BINARY}_edgenet_${PLATFORM}" >&2; exit 1; }
 RUN mkdir -p /${BINARY}
-RUN curl -L https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/genesis.json -o /${BINARY}/genesis.json
+RUN curl -fL --retry 3 --retry-delay 2 -o /${BINARY}/genesis.json \
+      https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/genesis.json \
+    || { echo "ERROR: failed to download genesis.json from https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/genesis.json" >&2; exit 1; }
+
+# Sanity check: fail the build if the downloaded binary isn't really an ELF
+# executable. curl -f above already aborts on HTTP errors, but this is a
+# second line of defense against an endpoint that answers 200 with an
+# unexpected body (e.g. an HTML/text error page) instead of the artifact.
+RUN MAGIC="$(head -c4 /bin/${BINARY} | od -An -tx1 | tr -d ' \n')"; \
+    [ "$MAGIC" = "7f454c46" ] || { \
+      echo "ERROR: /bin/${BINARY} is not an ELF binary (magic bytes: ${MAGIC:-<empty>}); the download from https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/${BINARY}_edgenet_${PLATFORM} did not return a valid artifact" >&2; \
+      exit 1; \
+    }
+
+# Sanity check: fail the build if genesis.json isn't valid JSON (same class
+# of defect as the binary check above).
+RUN jq empty /${BINARY}/genesis.json || { \
+      echo "ERROR: /${BINARY}/genesis.json is not valid JSON; the download from https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/genesis.json did not return a valid artifact" >&2; \
+      exit 1; \
+    }
 
 # Make binary executable
 RUN chmod +x /bin/${BINARY}

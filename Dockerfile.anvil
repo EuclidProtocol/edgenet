@@ -1,6 +1,6 @@
 # Shared image for every anvil fork service. Services differ only by
-# environment variables (CHAIN_NAME, FORK_RPC_URL, BLOCK_TIME_MS,
-# SNAPSHOT_API_URL, ANVIL_PORT), never by Dockerfile.
+# environment variables (CHAIN_NAME, FORK_RPC_URL, FORK_BLOCK, ANVIL_PORT),
+# never by Dockerfile.
 FROM ghcr.io/foundry-rs/foundry:stable AS foundry
 
 FROM ubuntu:24.04

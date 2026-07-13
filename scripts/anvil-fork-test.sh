@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 #
 # Self-test for anvil-fork.sh. No bats, no network: sources the script
-# (main() is guarded behind BASH_SOURCE) and replaces the two RPC accessors
-# with a simulated chain whose block N has timestamp
-# GENESIS_TS + N * MOCK_ACTUAL_BLOCK_TIME, optionally pruned below a floor.
+# (main() is guarded behind BASH_SOURCE) for unit-level checks, and runs
+# the entrypoint end to end with a stubbed anvil that prints its argv.
 #
 # Run: bash scripts/anvil-fork-test.sh
 
@@ -13,47 +12,6 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source-path=SCRIPTDIR
 # shellcheck source=anvil-fork.sh
 source "$SCRIPT_DIR/anvil-fork.sh"
-
-# --- mock chain ----------------------------------------------------------------
-
-MOCK_LATEST=1000000
-MOCK_GENESIS_TS=1700000000
-MOCK_ACTUAL_BLOCK_TIME_MS=2000
-MOCK_PRUNE_BELOW=0
-MIN_PROBED=""
-
-get_latest_block() { echo "$MOCK_LATEST"; }
-
-# Block N's timestamp in whole seconds: sub-second chains put several blocks
-# in the same second, which the resolver must tolerate (it returns the
-# greatest such block, matching the real "greatest ts <= target" contract).
-mock_block_ts() { echo $(( MOCK_GENESIS_TS + ($1 * MOCK_ACTUAL_BLOCK_TIME_MS) / 1000 )); }
-
-fetch_block_ts() {
-  PROBES=$(( PROBES + 1 ))
-  if [[ -z "$MIN_PROBED" ]] || (( $1 < MIN_PROBED )); then MIN_PROBED=$1; fi
-  if (( $1 < MOCK_PRUNE_BELOW )); then
-    BLOCK_TS=""
-    return 0
-  fi
-  BLOCK_TS=$(mock_block_ts "$1")
-}
-
-mock_latest_ts() { mock_block_ts "$MOCK_LATEST"; }
-
-reset_mocks() {
-  MOCK_LATEST=1000000
-  MOCK_GENESIS_TS=1700000000
-  MOCK_ACTUAL_BLOCK_TIME_MS=2000
-  MOCK_PRUNE_BELOW=0
-  MIN_PROBED=""
-  PROBES=0
-  RESULT_BLOCK=""
-  RESULT_TS=""
-  SEEDED_LO=""
-  BLOCK_TIME_MS=2000
-  CHAIN_NAME=testchain
-}
 
 # --- harness --------------------------------------------------------------------
 
@@ -65,14 +23,6 @@ fail() { FAIL=$(( FAIL + 1 )); printf 'FAIL %s\n' "$1"; }
 
 assert_eq() { # expected actual desc
   if [[ "$1" == "$2" ]]; then pass "$3"; else fail "$3 (expected $1, got $2)"; fi
-}
-
-assert_le() { # actual max desc
-  if (( $1 <= $2 )); then pass "$3 ($1 <= $2)"; else fail "$3 ($1 > $2)"; fi
-}
-
-assert_ge() { # actual min desc
-  if (( $1 >= $2 )); then pass "$3 ($1 >= $2)"; else fail "$3 ($1 < $2)"; fi
 }
 
 expect_die() { # desc pattern cmd...
@@ -88,110 +38,102 @@ expect_die() { # desc pattern cmd...
   fi
 }
 
-# Greatest block N whose (second-truncated) timestamp is <= $1, per the mock
-# chain. Derived rather than hardcoded so sub-second cases stay checkable.
-expected_block() {
-  echo $(( ((($1 - MOCK_GENESIS_TS) + 1) * 1000 - 1) / MOCK_ACTUAL_BLOCK_TIME_MS ))
+# Stub anvil: `exec anvil ...` in the entrypoint hits this instead, printing
+# its argv one per line so tests can assert on the exact command produced.
+stub_dir=$(mktemp -d)
+trap 'rm -rf "$stub_dir"' EXIT
+printf '#!/bin/sh\necho ANVIL_WAS_INVOKED\nfor a in "$@"; do echo "arg:$a"; done\nexit 0\n' >"$stub_dir/anvil"
+chmod +x "$stub_dir/anvil"
+
+# desc env... -- runs the entrypoint with the anvil stub; sets RUN_RC / RUN_OUT.
+RUN_RC=0
+RUN_OUT=""
+run_entrypoint() {
+  RUN_RC=0
+  RUN_OUT=$(env "$@" PATH="$stub_dir:$PATH" bash "$SCRIPT_DIR/anvil-fork.sh" 2>&1) || RUN_RC=$?
 }
 
 # --- tests ------------------------------------------------------------------------
 
-# 1. 6-hour-old snapshot on a 2s chain: exact block, logarithmic probes,
-#    and no probe below the seeded lower bound.
-reset_mocks
-target=$(( $(mock_latest_ts) - 21600 ))
-resolve_fork_block "$target"
-assert_eq $(( MOCK_LATEST - 10800 )) "$RESULT_BLOCK" "6h/2s: resolves exact block"
-assert_eq "$target" "$RESULT_TS" "6h/2s: zero drift on aligned target"
-assert_le "$PROBES" 20 "6h/2s: probe count is logarithmic"
-assert_ge "$MIN_PROBED" "$SEEDED_LO" "6h/2s: no probe below seeded LO"
-echo "     (6h-old snapshot on 2s chain used $PROBES block probes, seeded LO $SEEDED_LO)"
+# 1. FORK_BLOCK unset: anvil forks at the chain tip, no --fork-block-number.
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545
+assert_eq 0 "$RUN_RC" "tip mode: entrypoint execs anvil successfully"
+if [[ "$RUN_OUT" != *"arg:--fork-block-number"* ]]; then
+  pass "tip mode: no --fork-block-number flag"
+else
+  fail "tip mode: no --fork-block-number flag (got: $RUN_OUT)"
+fi
+if [[ "$RUN_OUT" == *"arg:--fork-url"* && "$RUN_OUT" == *"arg:http://rpc.example"* ]]; then
+  pass "tip mode: --fork-url is passed through"
+else
+  fail "tip mode: --fork-url is passed through (got: $RUN_OUT)"
+fi
+if [[ "$RUN_OUT" == *"arg:--port"* && "$RUN_OUT" == *"arg:8545"* ]]; then
+  pass "tip mode: --port is passed through"
+else
+  fail "tip mode: --port is passed through (got: $RUN_OUT)"
+fi
+if [[ "$RUN_OUT" == *"chain tip"* ]]; then
+  pass "tip mode: log announces chain-tip mode"
+else
+  fail "tip mode: log announces chain-tip mode (got: $RUN_OUT)"
+fi
 
-# 2. Target between two blocks: greatest block with ts <= target wins.
-reset_mocks
-target=$(( $(mock_latest_ts) - 21600 + 1 ))
-resolve_fork_block "$target"
-assert_eq $(( MOCK_LATEST - 10800 )) "$RESULT_BLOCK" "between-blocks: floors to earlier block"
-assert_eq 1 $(( target - RESULT_TS )) "between-blocks: reports 1s drift"
-assert_ge "$MIN_PROBED" "$SEEDED_LO" "between-blocks: no probe below seeded LO"
+# 2. FORK_BLOCK set but empty: same as unset (compose passes empty strings
+#    for undefined .env vars, so empty must mean tip, not an error).
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 FORK_BLOCK=
+assert_eq 0 "$RUN_RC" "empty FORK_BLOCK: entrypoint execs anvil successfully"
+if [[ "$RUN_OUT" != *"arg:--fork-block-number"* && "$RUN_OUT" == *"chain tip"* ]]; then
+  pass "empty FORK_BLOCK: treated as chain tip"
+else
+  fail "empty FORK_BLOCK: treated as chain tip (got: $RUN_OUT)"
+fi
 
-# 3. Target at/after the chain head: fork at head, single probe.
-reset_mocks
-target=$(( $(mock_latest_ts) + 500 ))
-resolve_fork_block "$target"
-assert_eq "$MOCK_LATEST" "$RESULT_BLOCK" "future target: forks at chain head"
-assert_eq 1 "$PROBES" "future target: only the head is probed"
+# 3. FORK_BLOCK set: the flag is passed with exactly that value.
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 FORK_BLOCK=12345678
+assert_eq 0 "$RUN_RC" "pinned mode: entrypoint execs anvil successfully"
+if [[ "$RUN_OUT" == *"arg:--fork-block-number
+arg:12345678"* ]]; then
+  pass "pinned mode: --fork-block-number 12345678 is passed"
+else
+  fail "pinned mode: --fork-block-number 12345678 is passed (got: $RUN_OUT)"
+fi
+if [[ "$RUN_OUT" == *"pinned block 12345678"* ]]; then
+  pass "pinned mode: log announces the pinned height"
+else
+  fail "pinned mode: log announces the pinned height (got: $RUN_OUT)"
+fi
 
-# 4. Nominal block time wrong (env says 4000ms, chain runs 2000ms): the guard
-#    must widen until the invariant holds, then still land on the exact block.
-reset_mocks
-BLOCK_TIME_MS=4000
-target=$(( $(mock_latest_ts) - 21600 ))
-resolve_fork_block "$target"
-assert_eq $(( MOCK_LATEST - 10800 )) "$RESULT_BLOCK" "widening: correct block despite bad estimate"
-assert_le "$PROBES" 30 "widening: probe count stays bounded"
+# 4. Malformed FORK_BLOCK is fatal before anvil starts.
+for bad in not-a-number -5 1.5 0 0x10; do
+  run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 FORK_BLOCK="$bad"
+  if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *"positive integer block number"* ]]; then
+    pass "FORK_BLOCK=$bad is fatal"
+  else
+    fail "FORK_BLOCK=$bad is fatal (rc=$RUN_RC, got: $RUN_OUT)"
+  fi
+  if [[ "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
+    pass "FORK_BLOCK=$bad dies before anvil starts"
+  else
+    fail "FORK_BLOCK=$bad dies before anvil starts (anvil was invoked)"
+  fi
+done
 
-# 4b. Sub-second chain, 1000ms blocks (somnia-class): seed must land in the
-#     right neighbourhood and the search stay logarithmic.
-reset_mocks
-BLOCK_TIME_MS=1000
-MOCK_ACTUAL_BLOCK_TIME_MS=1000
-target=$(( $(mock_latest_ts) - 21600 ))
-resolve_fork_block "$target"
-assert_eq "$(expected_block "$target")" "$RESULT_BLOCK" "1000ms: resolves exact block"
-assert_eq $(( MOCK_LATEST - 21600 )) "$RESULT_BLOCK" "1000ms: 21600 blocks back over 6h"
-assert_le "$PROBES" 22 "1000ms: probe count is logarithmic"
-assert_ge "$MIN_PROBED" "$SEEDED_LO" "1000ms: no probe below seeded LO"
-echo "     (6h-old snapshot on 1000ms chain used $PROBES block probes, seeded LO $SEEDED_LO)"
+# 5. Missing required env is fatal.
+run_entrypoint CHAIN_NAME=base ANVIL_PORT=8545
+if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *FORK_RPC_URL* && "$RUN_OUT" == *"is not set"* ]]; then
+  pass "missing FORK_RPC_URL is fatal and names the variable"
+else
+  fail "missing FORK_RPC_URL is fatal and names the variable (rc=$RUN_RC, got: $RUN_OUT)"
+fi
 
-# 4c. Sub-second chain, 100ms blocks: ten blocks share each wall-clock second,
-#     so the resolver must return the LAST block of the target second.
-reset_mocks
-BLOCK_TIME_MS=100
-MOCK_ACTUAL_BLOCK_TIME_MS=100
-target=$(( $(mock_latest_ts) - 21600 ))
-resolve_fork_block "$target"
-assert_eq "$(expected_block "$target")" "$RESULT_BLOCK" "100ms: resolves last block of target second"
-assert_eq 0 $(( target - RESULT_TS )) "100ms: zero drift"
-assert_le "$PROBES" 25 "100ms: probe count is logarithmic"
-assert_ge "$MIN_PROBED" "$SEEDED_LO" "100ms: no probe below seeded LO"
-assert_ge "$SEEDED_LO" 1 "100ms: seeded LO stays >= 1"
-assert_le "$SEEDED_LO" "$RESULT_BLOCK" "100ms: seed lands below the answer"
-echo "     (6h-old snapshot on 100ms chain used $PROBES block probes, seeded LO $SEEDED_LO)"
-
-# 4d. Non-integer BLOCK_TIME_MS is fatal (the field is milliseconds, not a float).
-expect_die "fractional BLOCK_TIME_MS is fatal" "positive integer number of milliseconds" \
-  env CHAIN_NAME=x FORK_RPC_URL=http://x BLOCK_TIME_MS=0.5 SNAPSHOT_API_URL=http://x ANVIL_PORT=1 \
-  bash "$SCRIPT_DIR/anvil-fork.sh"
-
-# 5. Pruned history: the window the search needs is unservable -> fatal.
-reset_mocks
-MOCK_PRUNE_BELOW=$(( MOCK_LATEST - 5000 ))
-target=$(( $(mock_latest_ts) - 21600 ))
-expect_die "pruned history is fatal" "pruned history" resolve_fork_block "$target"
-
-# 6. Chain younger than the snapshot: block 1 already after target -> fatal.
-reset_mocks
-target=$(( MOCK_GENESIS_TS - 100 ))
-expect_die "chain younger than snapshot is fatal" "younger than the snapshot" resolve_fork_block "$target"
-
-# 7. Metadata handling: missing/null/unparseable blockTime are fatal,
-#    valid ISO 8601 (with milliseconds) round-trips through epoch.
-expect_die "missing blockTime is fatal" "no blockTime" extract_target_ts '{"height": 123}'
-expect_die "null blockTime is fatal" "no blockTime" extract_target_ts '{"blockTime": null}'
-expect_die "garbage blockTime is fatal" "cannot parse" extract_target_ts '{"blockTime": "not-a-date"}'
-expect_die "invalid JSON is fatal" "not valid JSON" extract_target_ts 'no json here'
-
-epoch=$(extract_target_ts '{"blockTime": "2026-07-13T10:00:00.000Z"}')
-roundtrip=$(jq -rn --argjson e "$epoch" '$e | todate')
-assert_eq "2026-07-13T10:00:00Z" "$roundtrip" "blockTime with millis parses to correct epoch"
-
-# 8. Quoted env values. A quote-preserving .env parse ships SNAPSHOT_API_URL as
-#    the literal string "https://.../api" (quotes included), which bash never
-#    strips, so curl sees a URL it cannot parse. require_env must reject it.
-QUOTED_URL='"https://snapshots.example/api"'
+# 6. Quoted env values. A quote-preserving .env parse ships FORK_RPC_URL as
+#    the literal string "http://rpc.example" (quotes included), which bash
+#    never strips, so anvil would dial a URL that cannot parse. require_env
+#    must reject it.
+QUOTED_URL='"https://rpc.example"'
 QUOTED_DENOM="'usync'"
-PLAIN_URL='https://snapshots.example/api'
+PLAIN_URL='https://rpc.example'
 
 expect_die "double-quoted value is rejected" "literal quote character" \
   require_env QUOTED_URL
@@ -210,36 +152,26 @@ else
   fail "unquoted value is accepted (require_env rejected a clean value)"
 fi
 
-# The whole point is to fail before the network: stub curl so any invocation
-# announces itself, then assert the run died without one.
-stub_dir=$(mktemp -d)
-trap 'rm -rf "$stub_dir"' EXIT
-printf '#!/bin/sh\necho CURL_WAS_INVOKED\nexit 0\n' >"$stub_dir/curl"
-chmod +x "$stub_dir/curl"
-
-rc=0
-out=$(PATH="$stub_dir:$PATH" \
-  CHAIN_NAME=base FORK_RPC_URL=http://rpc.example BLOCK_TIME_MS=2000 \
-  SNAPSHOT_API_URL='"https://snapshots.example/api"' ANVIL_PORT=8545 \
-  bash "$SCRIPT_DIR/anvil-fork.sh" 2>&1) || rc=$?
-
-if (( rc != 0 )); then
-  pass "quoted SNAPSHOT_API_URL: entrypoint exits non-zero"
+# The whole point is to fail before anvil dials out: a quoted FORK_RPC_URL
+# through the real entrypoint must die without invoking anvil.
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL='"http://rpc.example"' ANVIL_PORT=8545
+if (( RUN_RC != 0 )); then
+  pass "quoted FORK_RPC_URL: entrypoint exits non-zero"
 else
-  fail "quoted SNAPSHOT_API_URL: entrypoint exits non-zero (exited 0)"
+  fail "quoted FORK_RPC_URL: entrypoint exits non-zero (exited 0)"
 fi
-if [[ "$out" == *"literal quote character"* && "$out" == *SNAPSHOT_API_URL* ]]; then
-  pass "quoted SNAPSHOT_API_URL: error names the variable and the cause"
+if [[ "$RUN_OUT" == *"literal quote character"* && "$RUN_OUT" == *FORK_RPC_URL* ]]; then
+  pass "quoted FORK_RPC_URL: error names the variable and the cause"
 else
-  fail "quoted SNAPSHOT_API_URL: error names the variable and the cause (got: $out)"
+  fail "quoted FORK_RPC_URL: error names the variable and the cause (got: $RUN_OUT)"
 fi
-if [[ "$out" != *CURL_WAS_INVOKED* ]]; then
-  pass "quoted SNAPSHOT_API_URL: dies before any curl runs"
+if [[ "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
+  pass "quoted FORK_RPC_URL: dies before anvil starts"
 else
-  fail "quoted SNAPSHOT_API_URL: dies before any curl runs (curl was invoked)"
+  fail "quoted FORK_RPC_URL: dies before anvil starts (anvil was invoked)"
 fi
 
-# 9. edgenet.sh guards the same failure mode on its own vars. HOME is a throwaway
+# 7. edgenet.sh guards the same failure mode on its own vars. HOME is a throwaway
 #    dir so a regression that reaches the `rm -rf $CHAIN_HOME/` cannot touch
 #    anything real.
 fake_home=$(mktemp -d)
@@ -256,12 +188,12 @@ else
   fail "edgenet.sh: quoted BINARY is rejected before any teardown (rc=$rc, got: $out)"
 fi
 
-# 10. Stale image: HOME is baked into the layer as `ENV HOME /${BINARY}`, so an
-#     image built while BINARY was quoted carries HOME=/"lumend" even after .env
-#     is cleaned up. Every var below is clean, so the .env loop passes and only
-#     the HOME check stands between this run and `rm -rf $CHAIN_HOME/`.
-#     CHAIN_HOME lands inside the temp dir; a sentinel there proves the teardown
-#     never ran, rather than merely trusting the exit code.
+# 8. Stale image: HOME is baked into the layer as `ENV HOME /${BINARY}`, so an
+#    image built while BINARY was quoted carries HOME=/"lumend" even after .env
+#    is cleaned up. Every var below is clean, so the .env loop passes and only
+#    the HOME check stands between this run and `rm -rf $CHAIN_HOME/`.
+#    CHAIN_HOME lands inside the temp dir; a sentinel there proves the teardown
+#    never ran, rather than merely trusting the exit code.
 stale_home="$fake_home/\"lumend\""
 mkdir -p "$stale_home/.lumend"
 : >"$stale_home/.lumend/sentinel"

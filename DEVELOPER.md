@@ -17,12 +17,12 @@ Lumen chain and relaunches it as a single validator local network via the
 **The anvil forks (`anvil-base`, `anvil-somnia`).** One service per EVM chain,
 all built from the same `Dockerfile.anvil` and all running
 `scripts/anvil-fork.sh` as their entrypoint. Each one forks a public EVM chain
-at the block that corresponds to the Lumen snapshot's wall clock time. Base
+either at the current chain tip or at a block height pinned in `.env`. Base
 listens on 8545, Somnia on 8546.
 
 The two kinds differ only in role. All anvil services share one image and one
 script; they are distinguished purely by environment (`CHAIN_NAME`,
-`FORK_RPC_URL`, `BLOCK_TIME_MS`, `SNAPSHOT_API_URL`, `ANVIL_PORT`). There is no
+`FORK_RPC_URL`, `FORK_BLOCK`, `ANVIL_PORT`). There is no
 per chain Dockerfile and there should never be one.
 
 Everything sits on the `edgenet-network` bridge network declared at the top of
@@ -38,191 +38,100 @@ implications:
 
 * The anvil containers and the Cosmos node start concurrently. An anvil
   container does not wait for the node, and the node does not wait for anvil.
-* The anvil containers do not depend on the node at runtime anyway. They read
-  the snapshot metadata over HTTP from `SNAPSHOT_API_URL`, which is a remote
-  service, not the local node. So the missing ordering is not currently a bug,
-  it is simply unenforced.
+* The anvil containers do not depend on the node at runtime anyway, and they
+  do not depend on the Lumen snapshot either. Each one only dials its own
+  `FORK_RPC_URL`, an upstream chain RPC, to fork from. So the missing ordering
+  is not currently a bug, it is simply unenforced.
 * The only backstop is `restart: on-failure`, present on every service. A
   container that dies (for example because its upstream RPC was briefly
-  unreachable) is restarted, and `scripts/anvil-fork.sh` re-runs its whole
-  resolution from scratch on each restart. Resolution is deterministic given the
-  same snapshot metadata and chain head, but it is not idempotent in the sense of
-  reusing a previous answer; each restart re-probes and can land on a different
-  block if the snapshot has been rotated in the meantime.
+  unreachable) is restarted, and `scripts/anvil-fork.sh` re-execs anvil with
+  the same `FORK_BLOCK` (or the same tip-forking behaviour, if `FORK_BLOCK` is
+  empty) on each restart. A pinned `FORK_BLOCK` reproduces the same fork every
+  time; an empty `FORK_BLOCK` forks whatever the chain tip is at restart time,
+  which can differ from the tip at the previous start.
 * If you ever add a consumer that needs the node's RPC to be live before it
   starts, you must add the ordering yourself. Do not assume it exists.
 
-## 2. The core algorithm: `scripts/anvil-fork.sh`
+## 2. `scripts/anvil-fork.sh`
 
-This is the most subtle part of the repository. Read it before changing anything
-in it.
+This script used to resolve a fork block from the Lumen snapshot's wall clock
+time by bisecting the upstream chain for the matching block, seeded by a
+nominal per chain interval and a snapshot metadata endpoint URL, both supplied
+through dedicated environment variables. That resolver, and the environment
+variables it used, have been removed entirely. There is no lookup and no
+search left in this script. If you are looking for time based fork alignment,
+it does not exist anymore; see the note on manual alignment in `README.md`
+under "Anvil forks".
 
-### The problem it solves
-
-The Cosmos node is restored from a snapshot taken at some past moment. The EVM
-forks must represent that same moment. If anvil forks Base at the current head
-while the Lumen node is replaying a six hour old snapshot, then every cross chain
-read is inconsistent: balances, oracle prices and contract state on the EVM side
-are from a different point in time than the Cosmos side. The two chains must
-agree on a wall clock instant.
-
-Cosmos snapshots carry a wall clock timestamp. EVM chains are addressed by block
-number. So the job is a lookup: given a wall clock instant, find the block number
-on the target chain that represents it. Formally, find the greatest block whose
-timestamp is less than or equal to the target.
-
-### Step by step
+### What it does now
 
 **1. Validate the environment.** `main()` calls `require_env` for `CHAIN_NAME`,
-`FORK_RPC_URL`, `BLOCK_TIME_MS`, `SNAPSHOT_API_URL`, `ANVIL_PORT`, then asserts
-`BLOCK_TIME_MS` matches `^[1-9][0-9]*$`. A fractional value such as `0.5` is
-fatal. The field is integer milliseconds, deliberately: sub second chains like
-Somnia cannot be expressed in whole seconds, and using milliseconds keeps all the
-later arithmetic in Bash integers.
+`FORK_RPC_URL`, `ANVIL_PORT`. `require_env` also rejects any of these values if
+it contains a literal quote character (see section 8), which matters because a
+quote surviving expansion silently corrupts a URL built from it rather than
+failing loudly on its own.
 
-**2. Fetch the snapshot metadata.** `curl -fsS "$SNAPSHOT_API_URL"`. A transport
-failure is fatal.
-
-**3. Extract `.blockTime`.** `extract_target_ts()` pulls `.blockTime` out of the
-JSON with `jq`. Three separate failures, all fatal:
-
-* the body is not valid JSON,
-* `.blockTime` is missing or `null` (this means the snapshot predates
-  `blockTime` support, and the fix is to take a fresh snapshot),
-* `.blockTime` is not parseable as ISO 8601.
-
-**4. ISO 8601 to epoch seconds.** `iso_to_epoch()` runs
-`jq -rn --arg t "$1" '$t | sub("\\.[0-9]+"; "") | fromdateiso8601'`. The `sub`
-strips fractional seconds, because `jq`'s `fromdateiso8601` rejects them. So
-`2026-07-13T10:00:00.000Z` becomes `2026-07-13T10:00:00Z` and then an epoch
-integer. Everything downstream is epoch seconds.
-
-**5. Read the chain head.** `resolve_fork_block()` calls `get_latest_block()`
-(`eth_blockNumber`, hex to decimal via `$(( hex ))`) and then `fetch_block_ts()`
-on that block. If the RPC cannot serve its own head block, that is fatal.
-
-**6. Short circuit on a future target.** If `target >= latest_ts`, the snapshot
-is at or newer than the chain head, so fork at the head. One probe total, no
-search.
-
-**7. Seed a lower bound.** This is where `BLOCK_TIME_MS` is used, and it is the
-*only* place it is used. It is a search hint, nothing more. It is never passed to
-anvil, and anvil is never told to mine at that interval.
+**2. Branch on `FORK_BLOCK`.**
 
 ```
-delta    = latest_ts - target                                 # seconds behind head
-est_back = ceil(delta * 1000 / BLOCK_TIME_MS)                 # blocks behind head
-         = (delta * 1000 + BLOCK_TIME_MS - 1) / BLOCK_TIME_MS # integer ceiling
-est      = max(1, latest - est_back)                          # estimated block
-margin   = max(1, est_back / 10)                              # 10 percent, integer division
-lo       = max(1, est - margin)
+if FORK_BLOCK is set and non-empty:
+  assert FORK_BLOCK matches ^[1-9][0-9]*$, else FATAL
+  exec anvil --fork-url "$FORK_RPC_URL" --fork-block-number "$FORK_BLOCK" \
+             --host 0.0.0.0 --port "$ANVIL_PORT"
+else:
+  exec anvil --fork-url "$FORK_RPC_URL" \
+             --host 0.0.0.0 --port "$ANVIL_PORT"
 ```
 
-Timestamps are seconds and block time is milliseconds, so the gap is scaled by
-1000 before dividing. The ceiling is done with the `(a + b - 1) / b` trick to stay
-in integer arithmetic. The 10 percent margin exists because the nominal block time
-is a nominal average; real chains drift, so the naive estimate `est` is not
-guaranteed to sit before the target. Backing off 10 percent makes it very likely
-that it does.
+An empty or unset `FORK_BLOCK` forks the upstream chain's current tip, because
+omitting `--fork-block-number` is anvil's own default behaviour. A `FORK_BLOCK`
+that is not a positive integer (a decimal, a negative number, `0`, a hex
+literal, non numeric text) is fatal before anvil ever starts.
 
-**8. Guard the invariant, widening as needed.** The binary search requires
-`block(lo).ts <= target`. The guard loop enforces it:
+**3. `exec` replaces the shell**, so anvil becomes PID 1 and receives signals
+directly, same as before.
 
-```
-loop:
-  ts = block(lo).ts
-  if ts is unavailable         -> FATAL (pruned history)
-  if ts <= target              -> invariant holds, exit loop
-  if lo == 1                   -> FATAL (chain younger than snapshot)
-  margin = margin * 2
-  lo     = max(1, est - margin)
-```
+### Consequence: no automatic time alignment
 
-Doubling the margin means a badly wrong `BLOCK_TIME_MS` costs a handful of extra
-probes, not correctness. The self-test proves this: with the environment claiming
-4000ms on a chain that actually runs at 2000ms, the resolver still lands on the
-exact right block.
+Because there is no metadata fetch and no search, `scripts/anvil-fork.sh` has no
+way to know what wall clock time the Lumen snapshot represents, and does not try
+to find out. `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` and the Lumen snapshot
+chosen via `SNAPSHOT_URL` are configured completely independently. Keeping them
+consistent (so that the Cosmos side and the EVM side represent roughly the same
+moment) is now something the operator has to do by hand, by picking the fork
+block that corresponds to their snapshot's timeframe themselves, for example
+using a block explorer.
 
-**9. Binary search `[lo, latest]`.** Standard "greatest element satisfying a
-monotone predicate" search, with the upper midpoint so that `mid > lo` always
-holds:
+### What the script no longer needs
 
-```
-hi = latest
-while lo < hi:
-  mid = lo + (hi - lo + 1) / 2      # upper midpoint: mid is strictly greater than lo
-  ts  = block(mid).ts
-  if ts is unavailable -> FATAL (refuse to guess)
-  if ts <= target: lo = mid; lo_ts = ts
-  else:            hi = mid - 1
-RESULT_BLOCK = lo
-RESULT_TS    = lo_ts
-```
-
-Because the midpoint rounds up, no probe is ever issued below the guarded lower
-bound. That property is asserted directly by the self-test (`MIN_PROBED >=
-SEEDED_LO`). It matters, and it is the reason the upper midpoint is used rather
-than the conventional lower one.
-
-Note that `lo_ts` is seeded by the guard loop, so if the guard's `lo` is already
-the answer (the loop body never runs), `RESULT_TS` is still correct.
-
-Timestamps are whole seconds, so on a sub second chain several blocks share one
-timestamp. The contract ("greatest block with ts <= target") resolves this
-unambiguously: you get the *last* block of that second.
-
-**10. Exec anvil.**
-
-```
-exec anvil \
-  --fork-url "$FORK_RPC_URL" \
-  --fork-block-number "$RESULT_BLOCK" \
-  --host 0.0.0.0 \
-  --port "$ANVIL_PORT"
-```
-
-`exec` replaces the shell, so anvil becomes PID 1 and receives signals directly.
-Before exec, the script logs the resolved block, its timestamp, the drift
-(`target_ts - RESULT_TS`, always a non negative number of seconds) and the number
-of block probes issued.
-
-### The fail fast contract
-
-Every failure mode in this script is a hard exit. There is no fallback path, on
-purpose:
-
-* A pruned or otherwise unservable block during the guard loop is fatal.
-* A pruned or otherwise unservable block mid search is fatal.
-* A chain whose block 1 is already after the target is fatal.
-* Missing, null or malformed snapshot metadata is fatal.
-
-The alternative would be to silently fall back to forking at the head, which
-produces a stack that looks healthy and is quietly wrong, which is the worst
-possible outcome. A container that refuses to start is loud and diagnosable.
-
-Related: the search never probes down from block 1. Public RPC endpoints are not
-archival; a deep probe into old history returns `null` or an error. The seeded
-lower bound means the script only ever touches a narrow window near the target.
-If that window is outside the RPC's retained history, the correct answer is "this
-RPC cannot serve this snapshot", not "let me try harder".
-
-### Restating the trap
-
-`BLOCK_TIME_MS` seeds the search and nothing else. It never reaches anvil. If you
-get it wrong by a factor of two, the guard loop widens and the search still
-returns the exact block. Order of magnitude matters, exactness does not.
+`curl` and `jq` were load bearing for the deleted resolver: JSON-RPC calls to
+look up when candidate blocks occurred, and parsing the snapshot metadata
+response. The current
+script makes no HTTP calls and does not invoke `jq` at all; it only does a bash
+regex check and execs anvil. `Dockerfile.anvil` still installs `curl` and `jq`
+in the image (see section 5); whether that is intentional (kept for interactive
+debugging, e.g. via `docker exec`) or leftover from the removed resolver is not
+stated anywhere in the repository, and it is not this document's place to guess. See section 7.
 
 ## 3. Boot sequence: `scripts/edgenet.sh`
 
 Runs as the entrypoint of the `edgenet` container. `set -e`, so any failing step
 aborts the boot. In order:
 
-1. **Wipe the home directory.** `rm -rf $CHAIN_HOME/` where
-   `CHAIN_HOME=$HOME/.$BINARY`. Since `HOME` is `/${BINARY}` (set in
-   `Dockerfile.edgenet`) and Compose bind mounts
-   `./.config/${CHAIN_ID}_edgenet/` onto `/${BINARY}/.${BINARY}/`, this wipes
-   the host side state too. Every boot is a clean boot. `make clean` does the
-   same thing from the host by removing `.config`.
+1. **Clear the home directory's contents.** `CHAIN_HOME=$HOME/.$BINARY`. Since
+   `HOME` is `/${BINARY}` (set in `Dockerfile.edgenet`) and Compose bind mounts
+   `./.config/${CHAIN_ID}_edgenet/` onto `/${BINARY}/.${BINARY}/`, `CHAIN_HOME`
+   is a live mountpoint from inside the container. It cannot be unlinked from
+   inside the container that holds it, so `rm -rf $CHAIN_HOME/` used to fail
+   with `rm: can't remove '/lumend/.lumend': Resource busy` and, because the
+   script runs under `set -e`, that killed the entrypoint on every boot (see
+   section 8 for the recovery steps if you hit this). The script now runs
+   `mkdir -p "$CHAIN_HOME"` followed by
+   `find "$CHAIN_HOME" -mindepth 1 -maxdepth 1 -exec rm -rf {} +`, which clears
+   everything under the mountpoint without touching the mountpoint itself.
+   `-mindepth 1` also picks up dotfiles and is a no-op on an already empty
+   directory. Every boot is still a clean boot from the chain's perspective.
+   `make clean` does the equivalent from the host by removing `.config`.
 2. **Init with the recovered mnemonic.**
    `echo $VALIDATOR_MNEMONIC | $BINARY init $VALIDATOR_MONIKER --chain-id
    $CHAIN_ID --home $CHAIN_HOME --default-denom $DENOM --recover`. Recovering
@@ -236,13 +145,25 @@ aborts the boot. In order:
 5. **Add the validator key.** `$BINARY keys add $VALIDATOR_MONIKER
    --keyring-backend test --recover` from the same mnemonic, then read the
    address back with `keys show -a` into `VALIDATOR_ADDRESS`.
-6. **Download the snapshot, but only if absent.** The cache path is
-   `$HOME/cache/snapshot.tar.lz4`, and `./cache/` is bind mounted from the host,
-   so the archive survives container rebuilds. The guard is a plain
-   `if [ ! -f "$SNAPSHOT_FILE" ]`. Two consequences worth knowing: a *stale*
-   cached snapshot is never refreshed, and a *truncated* download is never
-   detected. To force a fresh snapshot, delete `cache/snapshot.tar.lz4` on the
-   host yourself. Note that `make clean` deliberately does not do this.
+6. **Resolve snapshot metadata, then download the snapshot, but only if
+   absent.** `SNAPSHOT_URL` is a metadata endpoint, not the archive. The script
+   `curl`s it, requires the body to be non empty and valid JSON, then reads
+   `.url` (the archive location) and `.height` (the cache key) out of it with
+   `jq`; a missing `.url` or `.height` is fatal. The cache path is
+   `$HOME/cache/snapshot-$SNAPSHOT_HEIGHT.tar.lz4`, and `./cache/` is bind
+   mounted from the host, so the archive survives container rebuilds. The
+   download guard is a plain `if [ ! -f "$SNAPSHOT_FILE" ]`, and the download
+   itself goes to a `.part` suffixed temp name that is renamed into place only
+   on success, so an interrupted download is never mistaken for a complete
+   cache entry. Two consequences still worth knowing: a *stale* metadata
+   response naming a height that is already cached is served the cached
+   archive without re-checking it, and there is no cross height pruning, so
+   `cache/` accumulates one archive per distinct height you have ever pointed
+   `SNAPSHOT_URL` at. To force a fresh download for a given height, delete that
+   height's `cache/snapshot-<height>.tar.lz4` on the host yourself. Note that
+   `make clean` deliberately does not do this. Older checkouts may still have a
+   leftover `cache/snapshot.tar.lz4` from before the cache key included the
+   height; it is orphaned and safe to delete.
 7. **Extract.** `lz4 -dc $SNAPSHOT_FILE | tar -C $CHAIN_HOME/ -xf -`. Streamed,
    so the tarball is never materialised on disk. This is why the image needs
    `lz4`.
@@ -272,44 +193,45 @@ improvement and has not been done.
 
 It is an offline self test. No `bats`, no test framework, no network. It works by
 sourcing `scripts/anvil-fork.sh` (whose `main()` is guarded behind
-`if [[ "${BASH_SOURCE[0]}" == "${0}" ]]`, so sourcing runs no side effects) and
-then redefining the two functions that touch the network, `get_latest_block()`
-and `fetch_block_ts()`, against a simulated chain. The mock chain gives block `N`
-the timestamp `MOCK_GENESIS_TS + N * MOCK_ACTUAL_BLOCK_TIME_MS / 1000` (integer
-truncated to whole seconds), with an optional `MOCK_PRUNE_BELOW` floor below
-which blocks report as unservable. The mock also records `MIN_PROBED`, the lowest
-block number the resolver ever asked for, which is what lets the test assert the
-"never probe below the seeded lower bound" property.
-
-The crucial design point is that the mock's *actual* block time
-(`MOCK_ACTUAL_BLOCK_TIME_MS`) is separate from the *nominal* block time the
-resolver is told (`BLOCK_TIME_MS`). Setting them to different values is how the
-widening behaviour gets tested.
+`if [[ "${BASH_SOURCE[0]}" == "${0}" ]]`, so sourcing runs no side effects) for
+unit level checks against `require_env`, and by running the entrypoint end to
+end as a subprocess against a stubbed `anvil` binary (a shell script placed
+first on `PATH` that just echoes its own argv) so the tests can assert on the
+exact command line the script would have execed.
 
 What it covers:
 
-* **Exact block resolution.** A six hour old snapshot on a 2s chain resolves to
-  exactly `latest - 10800`, with zero drift, in a logarithmic number of probes,
-  and with no probe below the seeded lower bound.
-* **Flooring between blocks.** A target one second past a block boundary still
-  resolves to the earlier block and reports 1s of drift.
-* **Future target.** A target beyond the chain head forks at the head and issues
-  exactly one probe.
-* **Wrong nominal block time.** The environment says 4000ms, the chain runs
-  2000ms; the guard loop widens the margin and the resolver still returns the
-  exact correct block within a bounded probe count.
-* **Sub second chains.** 1000ms blocks (Somnia class) and 100ms blocks. At 100ms
-  ten blocks share each wall clock second, and the test asserts the resolver
-  returns the *last* block of the target second.
-* **Fractional `BLOCK_TIME_MS` is fatal.** Runs the real script as a subprocess
-  with `BLOCK_TIME_MS=0.5` and asserts a non zero exit.
-* **Pruned history is fatal.** Prunes below `latest - 5000` while the target sits
-  much further back, and asserts the resolver dies rather than guessing.
-* **Chain younger than the snapshot is fatal.** Target before the mock chain's
-  genesis, so block 1 is already after the target.
-* **Malformed metadata is fatal.** Missing `blockTime`, null `blockTime`,
-  unparseable `blockTime`, and a body that is not JSON at all. Plus one positive
-  case: an ISO 8601 timestamp with milliseconds round trips to the correct epoch.
+* **`FORK_BLOCK` unset forks the tip.** No `--fork-block-number` flag is
+  emitted, `--fork-url` and `--port` are passed through, and the log announces
+  chain tip mode.
+* **`FORK_BLOCK` set but empty behaves the same as unset.** This matters
+  because Compose passes an empty string, not an absent variable, for an
+  unset `.env` entry, so empty has to mean tip, not an error.
+* **`FORK_BLOCK` set to a valid height** produces
+  `--fork-block-number <that height>` exactly, and the log announces the
+  pinned height.
+* **Malformed `FORK_BLOCK` is fatal before anvil starts.** Covers
+  `not-a-number`, `-5`, `1.5`, `0`, and `0x10`; each must exit non zero with
+  `positive integer block number` in the output, and the anvil stub must never
+  have been invoked.
+* **Missing required environment is fatal and names the variable**, e.g. an
+  absent `FORK_RPC_URL`.
+* **Quoted environment values are rejected**, both at the `require_env` unit
+  level and end to end through the entrypoint with a quoted `FORK_RPC_URL`;
+  the entrypoint must die before anvil is invoked, naming the offending
+  variable and the literal quote character.
+* **`edgenet.sh` rejects a quoted `BINARY`** before any teardown of the chain
+  home runs.
+* **`edgenet.sh` also fails safely when `HOME` itself is quoted** (the stale
+  image case, see section 8): it asserts the script exits non zero, that a
+  sentinel file placed inside the chain home survives (proving the
+  entrypoint died before touching it), and that the error message points at
+  rebuilding the image rather than editing `.env`.
+
+None of this exercises `SNAPSHOT_URL` resolution, snapshot download, or the
+`edgenet` container's boot sequence; the self test is scoped to
+`scripts/anvil-fork.sh` and the environment guard shared with
+`scripts/edgenet.sh`.
 
 It exits non zero if any assertion fails and prints a `passed: N failed: M`
 summary.
@@ -328,8 +250,10 @@ source of binaries. The final stage is `ubuntu:24.04` with `bash`,
 copied across from the foundry stage. `scripts/anvil-fork.sh` is copied to
 `/usr/local/bin/` and set as the `ENTRYPOINT`.
 
-`jq` and `curl` are load bearing: the resolver script uses them for every JSON-RPC
-call and for parsing the snapshot metadata.
+`jq` and `curl` are installed but, as of the current `scripts/anvil-fork.sh`,
+not used by it; see section 2 and the note in section 7. They may be there for
+interactive debugging via `docker exec`, or simply left over from the removed
+resolver; the repository does not say which.
 
 This is one image for every chain. `docker-compose.yml` tags it
 `edgenet-anvil:local` and both anvil services reference the same tag and the same
@@ -356,6 +280,22 @@ https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/genesis.json
 that blob store being up), and a new binary or genesis requires an image rebuild,
 not just a restart. That is why nearly every Make target passes `--build`.
 
+Both downloads use `curl -fL` with retries, and both are validated afterwards.
+This is not decoration. Neither one used `-f` originally, and without it curl
+exits 0 on an HTTP error and writes the error body to disk as though it were the
+artifact. The blob store answers a missing object with a 404 and a 15 byte
+`text/plain` body reading `Blob not found`, so the build wrote those 15 bytes to
+`/bin/${BINARY}`, marked them executable, and succeeded. The container then died
+at runtime for reasons that pointed nowhere near the real cause. The binary is
+now checked for ELF magic bytes and `genesis.json` is checked with `jq empty`, so
+an endpoint that answers 200 with the wrong body is caught too, and the build
+fails naming the URL it could not fetch.
+
+Note that a `RUN curl ...` layer is cached on the command text, not on the
+response body. If an artifact is re-uploaded to the blob store under the same
+URL, a plain `make build` reuses the stale layer and never re-fetches. Use
+`make build-force`, which passes `--no-cache --pull`.
+
 `HOME` is set to `/${BINARY}`, which is what makes `$HOME/.$BINARY`,
 `$HOME/cache/` and `$HOME/genesis.json` in `edgenet.sh` resolve correctly. If you
 change `HOME`, you break the volume mounts in `docker-compose.yml`, which are
@@ -368,11 +308,12 @@ Three edits. Say the chain is called Arbitrum.
 **1. `.env.example` (and your own `.env`).** Add two lines:
 
 ```
-ARBITRUM_FORK_RPC_URL="https://arb1.arbitrum.io/rpc"
-ARBITRUM_BLOCK_TIME_MS=250
+ARBITRUM_FORK_RPC_URL=https://arb1.arbitrum.io/rpc
+ARBITRUM_FORK_BLOCK=
 ```
 
-The block time is a nominal average. Order of magnitude is what matters.
+Leave the fork block empty to fork the chain tip, or set a pinned block number.
+There is no per chain timing variable to add anymore.
 
 **2. `docker-compose.yml`.** Add a service, copying `anvil-base` verbatim and
 changing four things: the service name, `CHAIN_NAME`, the two variable names it
@@ -389,8 +330,7 @@ reads, and the port. Pick a port not already used (8545 and 8546 are taken).
     environment:
       - CHAIN_NAME=arbitrum
       - FORK_RPC_URL=${ARBITRUM_FORK_RPC_URL}
-      - BLOCK_TIME_MS=${ARBITRUM_BLOCK_TIME_MS:-250}
-      - SNAPSHOT_API_URL=${SNAPSHOT_API_URL}
+      - FORK_BLOCK=${ARBITRUM_FORK_BLOCK}
       - ANVIL_PORT=8547
     ports:
       - 8547:8547
@@ -457,17 +397,22 @@ None of these are blocking. All of them are real.
   `# shellcheck disable=` and `# shellcheck source=` directives, so someone ran
   it once, but it is not in a Make target and not in CI.
 * **No LICENSE file.**
-* **Snapshot cache is never invalidated.** Covered in section 3: `edgenet.sh`
-  downloads only when `cache/snapshot.tar.lz4` is absent, so a stale or truncated
-  archive persists silently.
-* **`SNAPSHOT_API_URL` is worth double checking.** The header comment in
-  `scripts/anvil-fork.sh` describes it as the "snapshot metadata endpoint
-  (`/snapshots/latest`)", and the script `curl`s the value verbatim and expects
-  `.blockTime` in the response body. `.env.example` sets it to the API root
-  (`https://snapshot.lumen.euclidprotocol.com/api`) with no path. Either the root
-  really does return the latest snapshot's metadata (in which case the comment is
-  stale) or the example value is wrong. Confirm against the live API before
-  trusting either.
+* **Snapshot cache is never invalidated, and never pruned.** Covered in
+  section 3: `edgenet.sh` downloads only when
+  `cache/snapshot-<height>.tar.lz4` is absent for that height, so a stale or
+  truncated archive persists silently, and `cache/` accumulates one archive
+  per distinct height ever requested with no cleanup.
+* **`Dockerfile.anvil` installs `curl` and `jq` that `scripts/anvil-fork.sh` no
+  longer uses.** The current script only validates `FORK_BLOCK` with a bash
+  regex and execs anvil; it makes no HTTP calls and never invokes `jq`. This is
+  a leftover from the removed metadata driven fork block resolver. Either drop
+  both packages from the image, or, if they are kept deliberately for
+  interactive `docker exec` debugging, say so next to the `RUN apt-get install`
+  line.
+* **Anvil forks and the Lumen snapshot can silently drift apart.** Nothing
+  ties `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` to the snapshot selected by
+  `SNAPSHOT_URL`; see section 2. There is no validation, warning, or check of
+  any kind if an operator changes one without the other.
 
 ## 8. Troubleshooting
 
@@ -491,11 +436,18 @@ mount instead of removing it cleanly.
 **anvil containers (`anvil-base`, `anvil-somnia`):**
 
 ```
-curl: (3) URL rejected: Port number was not a decimal number between 0 and 65535
+FATAL: environment variable FORK_RPC_URL contains a literal quote character
 ```
 
-This means `SNAPSHOT_API_URL` reached the container as a quoted string, and curl
-parsed the trailing quote as part of what it expected to be a port number.
+This means `FORK_RPC_URL` (or another anvil variable) reached the container as
+a quoted string. `scripts/anvil-fork.sh`'s `require_env` catches this before
+anvil is ever execed. At the time this bug was first found, the script still
+fetched a since removed metadata endpoint variable with `curl`, and a quoted
+value there surfaced as a curl argument parsing error instead of this
+`require_env` message; that code path no longer exists (see section 2), but
+the underlying cause, a quoted `.env` value, is the same regardless of which
+anvil variable carries it, and `require_env` now catches it earlier and more
+clearly than curl's own error ever did.
 
 Both symptoms share one root cause. The `Makefile` used to begin with `-include
 .env` plus a bare `export`. GNU Make parses `.env` as makefile syntax, not as a
@@ -521,3 +473,30 @@ enough. The image has to be rebuilt too. Recover in this order.
    `BINARY` value was baked into the image layer at `ENV HOME`, so a plain
    restart without a rebuild reuses that layer and reproduces the same
    failure.
+
+### `Resource busy` on a clean, unquoted path
+
+This looks similar to the quote poisoning case above but has a different cause
+and a different fix. Do not confuse the two: check whether the path in the
+error message contains literal quote characters. If it does not, this section
+applies instead.
+
+```
+rm: can't remove '/lumend/.lumend': Resource busy
+```
+
+No quotes anywhere in that path. This was a bug in `scripts/edgenet.sh` itself,
+independent of any `.env` value: the old boot sequence ran `rm -rf
+$CHAIN_HOME/` to wipe the chain home on every start, but `docker-compose.yml`
+bind mounts `./.config/${CHAIN_ID}_edgenet/` onto exactly that path
+(`CHAIN_HOME`). A bind mountpoint cannot be unlinked from inside the container
+that holds it, so the `rm -rf` failed with `EBUSY`, `set -e` treated that as a
+fatal error, and the entrypoint died on every single boot, quoted values or
+not.
+
+The fix (see section 3, step 1) was to stop trying to remove `CHAIN_HOME`
+itself and instead clear only its contents with `find "$CHAIN_HOME" -mindepth
+1 -maxdepth 1 -exec rm -rf {} +`, after `mkdir -p "$CHAIN_HOME"`. If you are
+running an older image that predates this fix, rebuild with `make edgenet` (or
+any target that passes `--build`); no `.env` edit is needed, since nothing
+here was ever a quoting problem.

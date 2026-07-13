@@ -40,8 +40,7 @@ services:
     environment:
       - CHAIN_NAME=base
       - FORK_RPC_URL=${BASE_FORK_RPC_URL}
-      - BLOCK_TIME_MS=${BASE_BLOCK_TIME_MS:-2000}
-      - SNAPSHOT_API_URL=${SNAPSHOT_API_URL}
+      - FORK_BLOCK=${BASE_FORK_BLOCK}
       - ANVIL_PORT=8545
     ports:
       - 8545:8545
@@ -59,8 +58,7 @@ services:
     environment:
       - CHAIN_NAME=somnia
       - FORK_RPC_URL=${SOMNIA_FORK_RPC_URL}
-      - BLOCK_TIME_MS=${SOMNIA_BLOCK_TIME_MS:-1000}
-      - SNAPSHOT_API_URL=${SNAPSHOT_API_URL}
+      - FORK_BLOCK=${SOMNIA_FORK_BLOCK}
       - ANVIL_PORT=8546
     ports:
       - 8546:8546
