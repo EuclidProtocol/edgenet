@@ -1,0 +1,18 @@
+# Shared image for every anvil fork service. Services differ only by
+# environment variables (CHAIN_NAME, FORK_RPC_URL, BLOCK_TIME_MS,
+# SNAPSHOT_API_URL, ANVIL_PORT), never by Dockerfile.
+FROM ghcr.io/foundry-rs/foundry:stable AS foundry
+
+FROM ubuntu:24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=foundry /usr/local/bin/anvil /usr/local/bin/anvil
+COPY --from=foundry /usr/local/bin/cast /usr/local/bin/cast
+
+COPY scripts/anvil-fork.sh /usr/local/bin/anvil-fork.sh
+RUN chmod +x /usr/local/bin/anvil-fork.sh
+
+ENTRYPOINT ["/usr/local/bin/anvil-fork.sh"]

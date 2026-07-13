@@ -1,0 +1,69 @@
+networks:
+  edgenet-network:
+
+services:
+  edgenet:
+    profiles:
+      - edgenet
+    build:
+      context: .
+      dockerfile: Dockerfile.edgenet
+      args:
+        - BINARY=${BINARY}
+        - PLATFORM=${PLATFORM}
+    volumes:
+      - ./.config/${CHAIN_ID}_edgenet/:/${BINARY}/.${BINARY}/
+      - ./cache/:/${BINARY}/cache/
+    environment:
+      - BINARY=${BINARY}
+      - CHAIN_ID=${CHAIN_ID}
+      - DENOM=${DENOM}
+      - STAKE_DENOM=${STAKE_DENOM}
+      - VALIDATOR_MONIKER=validator
+      - VALIDATOR_MNEMONIC=${VALIDATOR_MNEMONIC}
+      - SNAPSHOT_URL=${SNAPSHOT_URL}
+    ports:
+      - 26657:26657 # RPC
+      - 1317:1317 # LCD
+      - 9090:9090 # GRPC
+    networks:
+      - edgenet-network
+    restart: on-failure
+
+  anvil-base:
+    profiles:
+      - edgenet
+    image: edgenet-anvil:local
+    build:
+      context: .
+      dockerfile: Dockerfile.anvil
+    environment:
+      - CHAIN_NAME=base
+      - FORK_RPC_URL=${BASE_FORK_RPC_URL}
+      - BLOCK_TIME_MS=${BASE_BLOCK_TIME_MS:-2000}
+      - SNAPSHOT_API_URL=${SNAPSHOT_API_URL}
+      - ANVIL_PORT=8545
+    ports:
+      - 8545:8545
+    networks:
+      - edgenet-network
+    restart: on-failure
+
+  anvil-somnia:
+    profiles:
+      - edgenet
+    image: edgenet-anvil:local
+    build:
+      context: .
+      dockerfile: Dockerfile.anvil
+    environment:
+      - CHAIN_NAME=somnia
+      - FORK_RPC_URL=${SOMNIA_FORK_RPC_URL}
+      - BLOCK_TIME_MS=${SOMNIA_BLOCK_TIME_MS:-1000}
+      - SNAPSHOT_API_URL=${SNAPSHOT_API_URL}
+      - ANVIL_PORT=8546
+    ports:
+      - 8546:8546
+    networks:
+      - edgenet-network
+    restart: on-failure

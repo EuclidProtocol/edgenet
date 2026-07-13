@@ -1,0 +1,38 @@
+FROM alpine:3.20
+
+ARG BINARY
+ARG PLATFORM
+
+RUN apk update
+RUN apk add bash
+RUN apk add curl
+RUN apk add "dasel>2.0.0"
+RUN apk add jq
+# lz4 is required by edgenet.sh to decompress the chain snapshot
+RUN apk add lz4
+
+# Download binary and config files
+RUN curl -L https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/${BINARY}_edgenet_${PLATFORM} -o /bin/${BINARY}
+RUN mkdir -p /${BINARY}
+RUN curl -L https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/genesis.json -o /${BINARY}/genesis.json
+
+# Make binary executable
+RUN chmod +x /bin/${BINARY}
+
+COPY scripts/edgenet.sh /${BINARY}/edgenet.sh
+# Make script executable
+RUN chmod +x /${BINARY}/edgenet.sh
+
+ENV HOME /${BINARY}
+WORKDIR $HOME
+
+# P2P
+EXPOSE 26656
+# RPC
+EXPOSE 26657
+# Rest
+EXPOSE 1317
+# GRPC
+EXPOSE 9090
+
+ENTRYPOINT ["./edgenet.sh"]

@@ -1,0 +1,6 @@
+.env
+.config/
+cache/
+logs/
+*.log
+.DS_Store
