@@ -43,11 +43,33 @@ esac
 CHAIN_HOME=$HOME/.$BINARY
 CONFIG_FOLDER=$CHAIN_HOME/config
 
-edit_client () {
+
+edit_config () {
     # Expose the rpc
+    dasel put -t string -f $CONFIG_FOLDER/config.toml '.rpc.laddr' -v "tcp://0.0.0.0:26657"
+
+    dasel put -t string -f $CONFIG_FOLDER/config.toml '.moniker' -v "edgenet-validator"
+}
+
+edit_client () {
     dasel put -t string -f $CONFIG_FOLDER/client.toml '.keyring-backend' -v "test"
     dasel put -t string -f $CONFIG_FOLDER/client.toml '.chain-id' -v $CHAIN_ID
 }
+
+edit_app () {
+    local APP=$CONFIG_FOLDER/app.toml
+
+    # Enable lcd
+    dasel put -t bool -f $APP '.api.enable' -v true
+    dasel put -t bool -f $APP '.api.enabled-unsafe-cors' -v true
+    dasel put -t string -f $APP '.api.address' -v "tcp://0.0.0.0:1317"
+    dasel put -t bool -f $APP '.api.swagger' -v true
+    dasel put -t string -f $APP '.grpc.address' -v "0.0.0.0:9090"
+    dasel put -t bool -f $APP '.grpc.enable' -v true
+    # Gas Price
+    dasel put -t string -f $APP 'minimum-gas-prices' -v "0.015$DENOM"
+}
+
 
 # CHAIN_HOME is a bind mount (docker-compose.yml maps ./.config/${CHAIN_ID}_edgenet/
 # onto it), so this sentinel outlives the container. Its presence means the chain was
@@ -84,6 +106,13 @@ echo -e "\nCopying genesis file..."
 cp $HOME/genesis.json $CONFIG_FOLDER/genesis.json
 echo ✅ Genesis file copied successfully.
 
+# Copy config.toml
+echo -e "\nCopying config.toml file..."
+cp $HOME/config.toml $CONFIG_FOLDER/config.toml
+echo ✅ Config.toml file copied successfully.
+
+edit_config
+edit_app
 edit_client
 
 echo "🔑 Adding validator account"

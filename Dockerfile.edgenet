@@ -22,6 +22,9 @@ RUN mkdir -p /${BINARY}
 RUN curl -fL --retry 3 --retry-delay 2 -o /${BINARY}/genesis.json \
       https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/genesis.json \
     || { echo "ERROR: failed to download genesis.json from https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/genesis.json" >&2; exit 1; }
+RUN curl -fL --retry 3 --retry-delay 2 -o /${BINARY}/config.toml \
+      https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/config.toml \
+    || { echo "ERROR: failed to download config.toml from https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/config.toml" >&2; exit 1; }
 
 # Sanity check: fail the build if the downloaded binary isn't really an ELF
 # executable. curl -f above already aborts on HTTP errors, but this is a
@@ -37,6 +40,13 @@ RUN MAGIC="$(head -c4 /bin/${BINARY} | od -An -tx1 | tr -d ' \n')"; \
 # of defect as the binary check above).
 RUN jq empty /${BINARY}/genesis.json || { \
       echo "ERROR: /${BINARY}/genesis.json is not valid JSON; the download from https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/genesis.json did not return a valid artifact" >&2; \
+      exit 1; \
+    }
+
+# Sanity check: fail the build if config.toml isn't valid TOML (same class
+# of defect as the checks above). dasel is already required for client.toml edits.
+RUN dasel -f /${BINARY}/config.toml >/dev/null || { \
+      echo "ERROR: /${BINARY}/config.toml is not valid TOML; the download from https://so7hoepmu4vbb7pi.public.blob.vercel-storage.com/${BINARY}/config.toml did not return a valid artifact" >&2; \
       exit 1; \
     }
 
