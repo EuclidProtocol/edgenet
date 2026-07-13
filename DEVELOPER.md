@@ -22,8 +22,8 @@ listens on 8545, Somnia on 8546.
 
 The two kinds differ only in role. All anvil services share one image and one
 script; they are distinguished purely by environment (`CHAIN_NAME`,
-`FORK_RPC_URL`, `FORK_BLOCK`, `ANVIL_PORT`). There is no
-per chain Dockerfile and there should never be one.
+`FORK_RPC_URL`, `FORK_BLOCK`, `BLOCK_TIME`, `EVM_CHAIN_ID`, `ANVIL_PORT`).
+There is no per chain Dockerfile and there should never be one.
 
 Everything sits on the `edgenet-network` bridge network declared at the top of
 `docker-compose.yml`, so containers can reach each other by service name. All
@@ -66,10 +66,14 @@ under "Anvil forks".
 ### What it does now
 
 **1. Validate the environment.** `main()` calls `require_env` for `CHAIN_NAME`,
-`FORK_RPC_URL`, `ANVIL_PORT`. `require_env` also rejects any of these values if
-it contains a literal quote character (see section 8), which matters because a
-quote surviving expansion silently corrupts a URL built from it rather than
-failing loudly on its own.
+`FORK_RPC_URL`, `ANVIL_PORT`, `BLOCK_TIME` and `EVM_CHAIN_ID`. `require_env`
+also rejects any of these values if it contains a literal quote character (see
+section 8), which matters because a quote surviving expansion silently
+corrupts a URL built from it rather than failing loudly on its own.
+`BLOCK_TIME` and `EVM_CHAIN_ID` are then each checked against
+`^[1-9][0-9]*$`, the same positive integer regex `FORK_BLOCK` is held to
+below; a non-positive-integer value in either one is fatal before anvil ever
+starts, same as a malformed `FORK_BLOCK`.
 
 **2. Branch on `FORK_BLOCK`.**
 
@@ -77,19 +81,95 @@ failing loudly on its own.
 if FORK_BLOCK is set and non-empty:
   assert FORK_BLOCK matches ^[1-9][0-9]*$, else FATAL
   exec anvil --fork-url "$FORK_RPC_URL" --fork-block-number "$FORK_BLOCK" \
+             --block-time "$BLOCK_TIME" --chain-id "$EVM_CHAIN_ID" \
              --host 0.0.0.0 --port "$ANVIL_PORT"
 else:
   exec anvil --fork-url "$FORK_RPC_URL" \
+             --block-time "$BLOCK_TIME" --chain-id "$EVM_CHAIN_ID" \
              --host 0.0.0.0 --port "$ANVIL_PORT"
 ```
 
 An empty or unset `FORK_BLOCK` forks the upstream chain's current tip, because
 omitting `--fork-block-number` is anvil's own default behaviour. A `FORK_BLOCK`
 that is not a positive integer (a decimal, a negative number, `0`, a hex
-literal, non numeric text) is fatal before anvil ever starts.
+literal, non numeric text) is fatal before anvil ever starts. `--block-time`
+and `--chain-id` are passed identically on both branches, since which block
+the fork starts at has no bearing on how it should mine or what chain id it
+should report.
 
 **3. `exec` replaces the shell**, so anvil becomes PID 1 and receives signals
 directly, same as before.
+
+### Why `--block-time` matters
+
+Without `--block-time`, anvil auto-mines a block on every transaction it
+receives and produces no empty blocks in between, so a fork sitting idle
+never advances: no new block appears until someone sends it a transaction.
+No real chain behaves that way. `BLOCK_TIME` (whole seconds, anvil's `-b`
+flag) makes the fork tick on a fixed interval regardless of transaction
+activity, the same way the upstream chain does. This was the single biggest
+realism gap in the fork and closing it is the point of this change.
+`BLOCK_TIME` is hardcoded per service in `docker-compose.yml`, 2 for
+`anvil-base` and 1 for `anvil-somnia`, rather than living in `.env`, because it
+is a property of how closely the fork should track the upstream chain's own
+cadence, not something a deployment should tune.
+
+### `--chain-id` is redundant, and passed on purpose anyway
+
+Unlike `--block-time`, `--chain-id` fixes nothing. Anvil inherits the chain id
+from the chain it forks. Run `ghcr.io/foundry-rs/foundry:stable` forking
+`https://mainnet.base.org` with no `--chain-id` flag at all and query
+`eth_chainId`, and it answers `0x2105`, which is 8453, Base's real chain id.
+Passing `EVM_CHAIN_ID` does not change observable behaviour for either fork
+we run today, and this document is not going to pretend otherwise.
+
+It is passed anyway, for two honest and fairly modest reasons:
+
+* It makes the value **explicit and reviewable in `docker-compose.yml`**
+  rather than implicit in whatever the upstream RPC happens to answer. A
+  reader of the compose file can see what chain each service claims to be
+  without going and asking an RPC endpoint.
+* It **pins the fork's identity** if `FORK_RPC_URL` is ever repointed at a
+  proxy, a testnet, or any endpoint that answers `eth_chainId` differently
+  from the chain the service is named after. The fork keeps reporting the id
+  it is configured with instead of quietly adopting whatever the new endpoint
+  says.
+
+That is the entire justification. If you are weighing whether to keep the
+flag, weigh it on those two grounds, not on a correctness claim, because
+there isn't one.
+
+### Why the variable is `EVM_CHAIN_ID` and not `CHAIN_ID`
+
+The values themselves (Base mainnet 8453, Somnia mainnet 5031) were queried
+live from the respective RPC endpoints via `eth_chainId` rather than copied
+from memory. The variable carrying them is named `EVM_CHAIN_ID` rather than
+`CHAIN_ID` because `CHAIN_ID` already names something else in this stack: the
+Cosmos chain id (`lumen-1`) consumed by the `edgenet` service. Reusing
+`CHAIN_ID` for anvil would put two unrelated identifiers, one Cosmos, one EVM,
+behind the same name across services, so the anvil variable gets its own name
+instead. That is a naming choice, not an inconsistency.
+
+### What was deliberately not overridden
+
+Forking already gives anvil a realistic gas limit, base fee, hardfork and
+code size limit, inherited from the upstream chain at the fork point.
+Anvil's own defaults for `--order` (transaction ordering by fees) and
+`--slots-in-an-epoch` (32) are also already realistic and match mainnet
+behaviour. None of these were added as flags or environment variables.
+Overriding any of them would make the fork less faithful to the chain it is
+forking, not more, so if you are tempted to "complete" this list, do not; the
+one real gap being closed here is the mining interval, not everything anvil
+could be told to override.
+
+### Known limitation: whole-second block time cannot match Somnia's real cadence
+
+Anvil's `-b` / `--block-time` flag only accepts whole seconds. Somnia's real
+block time is well under a second, so `anvil-somnia` is configured with
+`BLOCK_TIME=1`, the smallest value anvil supports, and still ticks slower
+than the real chain. There is no anvil flag that accepts sub-second
+intervals, so this gap cannot be closed from this script; it is listed again
+as a known gap in section 7.
 
 ### Consequence: no automatic time alignment
 
@@ -295,16 +375,28 @@ What it covers:
 * **`FORK_BLOCK` set to a valid height** produces
   `--fork-block-number <that height>` exactly, and the log announces the
   pinned height.
+* **`--block-time` and `--chain-id` are passed on both branches**, tip and
+  pinned, with the exact values from `BLOCK_TIME` and `EVM_CHAIN_ID`, and the
+  log line announces both (`chain id <id>`, `mining every <n>s`). A second
+  case runs the entrypoint as Somnia (`BLOCK_TIME=1`, `EVM_CHAIN_ID=5031`) to
+  confirm the values are read from the environment per chain, not hardcoded
+  to Base's.
 * **Malformed `FORK_BLOCK` is fatal before anvil starts.** Covers
   `not-a-number`, `-5`, `1.5`, `0`, and `0x10`; each must exit non zero with
   `positive integer block number` in the output, and the anvil stub must never
   have been invoked.
+* **Malformed `BLOCK_TIME` or `EVM_CHAIN_ID` is fatal before anvil starts**,
+  on the same terms and against the same bad values as `FORK_BLOCK`, including
+  a hex value (`0x10`), the form `eth_chainId` itself would report a chain id
+  in, which anvil would otherwise reject on its own terms rather than this
+  script's.
 * **Missing required environment is fatal and names the variable**, e.g. an
-  absent `FORK_RPC_URL`.
+  absent `FORK_RPC_URL`, or an absent or empty `BLOCK_TIME` / `EVM_CHAIN_ID`;
+  the anvil stub must never have been invoked.
 * **Quoted environment values are rejected**, both at the `require_env` unit
-  level and end to end through the entrypoint with a quoted `FORK_RPC_URL`;
-  the entrypoint must die before anvil is invoked, naming the offending
-  variable and the literal quote character.
+  level and end to end through the entrypoint with a quoted `FORK_RPC_URL` or
+  a quoted `BLOCK_TIME`; the entrypoint must die before anvil is invoked,
+  naming the offending variable and the literal quote character.
 * **`edgenet.sh` rejects a quoted `BINARY`** before any teardown of the chain
   home runs.
 * **`edgenet.sh` also fails safely when `HOME` itself is quoted** (the stale
@@ -400,9 +492,14 @@ ARBITRUM_FORK_BLOCK=
 Leave the fork block empty to fork the chain tip, or set a pinned block number.
 There is no per chain timing variable to add anymore.
 
-**2. `docker-compose.yml`.** Add a service, copying `anvil-base` verbatim and
-changing four things: the service name, `CHAIN_NAME`, the two variable names it
-reads, and the port. Pick a port not already used (8545 and 8546 are taken).
+**2. `docker-compose.yml`.** Add a service, starting from `anvil-base` as a
+template. The service name, `CHAIN_NAME`, the two `.env` backed variable
+names, and the port all change the same way they did before. Two more values
+now need to be set as literals, `BLOCK_TIME` and `EVM_CHAIN_ID`: these are not
+copied from `anvil-base`, they are facts about Arbitrum itself (its own block
+time in whole seconds, and its own EVM chain id, queried live via
+`eth_chainId`), the same way Base carries `2`/`8453` and Somnia carries
+`1`/`5031`. Pick a port not already used (8545 and 8546 are taken).
 
 ```yaml
   anvil-arbitrum:
@@ -412,10 +509,14 @@ reads, and the port. Pick a port not already used (8545 and 8546 are taken).
     build:
       context: .
       dockerfile: Dockerfile.anvil
+    # BLOCK_TIME is whole seconds (anvil's -b flag). EVM_CHAIN_ID is
+    # Arbitrum One's real chain id, not an arbitrary value.
     environment:
       - CHAIN_NAME=arbitrum
       - FORK_RPC_URL=${ARBITRUM_FORK_RPC_URL}
       - FORK_BLOCK=${ARBITRUM_FORK_BLOCK}
+      - BLOCK_TIME=1
+      - EVM_CHAIN_ID=42161
       - ANVIL_PORT=8547
     ports:
       - 8547:8547
@@ -425,7 +526,9 @@ reads, and the port. Pick a port not already used (8545 and 8546 are taken).
 ```
 
 Note `ANVIL_PORT` and the published port must match, because the port mapping is
-`8547:8547`.
+`8547:8547`. `BLOCK_TIME` and `EVM_CHAIN_ID` are both required by
+`scripts/anvil-fork.sh`; a missing, non-positive-integer, or quote-containing
+value is fatal before anvil starts, see section 2.
 
 **3. `Makefile`.** Add the three convenience targets and register them in
 `.PHONY`:
@@ -498,6 +601,11 @@ None of these are blocking. All of them are real.
   ties `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` to the snapshot selected by
   `SNAPSHOT_URL`; see section 2. There is no validation, warning, or check of
   any kind if an operator changes one without the other.
+* **`anvil-somnia` cannot tick as fast as the real Somnia chain.** Anvil's
+  `--block-time` only accepts whole seconds, so `anvil-somnia` runs at the
+  smallest value anvil supports, `BLOCK_TIME=1`, while Somnia's real block
+  time is well under a second. The fork therefore mines slower than the chain
+  it forks. No anvil flag fixes this; see section 2.
 * **An unrelated crash can now loop instead of self-healing.** Persisting the
   chain across restarts (section 3) means Compose's `restart: on-failure` on
   the `edgenet` service restarts the container straight back into

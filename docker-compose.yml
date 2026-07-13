@@ -38,10 +38,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.anvil
+    # BLOCK_TIME is whole seconds (anvil's -b flag). EVM_CHAIN_ID is Base
+    # mainnet's real chain id, not an arbitrary value.
     environment:
       - CHAIN_NAME=base
       - FORK_RPC_URL=${BASE_FORK_RPC_URL}
       - FORK_BLOCK=${BASE_FORK_BLOCK}
+      - BLOCK_TIME=2
+      - EVM_CHAIN_ID=8453
       - ANVIL_PORT=8545
     ports:
       - 8545:8545
@@ -56,10 +60,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.anvil
+    # BLOCK_TIME is whole seconds (anvil's -b flag). EVM_CHAIN_ID is Somnia
+    # mainnet's real chain id, not an arbitrary value.
     environment:
       - CHAIN_NAME=somnia
       - FORK_RPC_URL=${SOMNIA_FORK_RPC_URL}
       - FORK_BLOCK=${SOMNIA_FORK_BLOCK}
+      - BLOCK_TIME=1
+      - EVM_CHAIN_ID=5031
       - ANVIL_PORT=8546
     ports:
       - 8546:8546

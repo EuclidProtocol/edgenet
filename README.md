@@ -145,18 +145,20 @@ The validator moniker is hard coded to `validator` in `docker-compose.yml` and i
 
 ### Variables passed to each anvil container
 
-`docker-compose.yml` maps the per chain `.env` variables onto a fixed set of variables that `scripts/anvil-fork.sh` reads. All three are required by the script.
+`docker-compose.yml` maps the per chain `.env` variables onto a fixed set of variables that `scripts/anvil-fork.sh` reads. All of these except `FORK_BLOCK` are required by the script.
 
 | Variable | Meaning |
 | --- | --- |
 | `CHAIN_NAME` | Label for the chain. **Logging only.** Nothing is looked up or resolved by it. Set literally in `docker-compose.yml`, not in `.env`. |
 | `FORK_RPC_URL` | Upstream RPC endpoint to fork. |
 | `FORK_BLOCK` | Block height to fork at, sourced from `<NAME>_FORK_BLOCK`. Empty or unset means fork the chain tip. |
+| `BLOCK_TIME` | Seconds between blocks, passed to anvil as `--block-time`. A fact about the upstream chain (Base 2, Somnia 1), set literally in `docker-compose.yml`, not in `.env`. Required; must be a positive integer. |
+| `EVM_CHAIN_ID` | EVM chain id anvil reports over `eth_chainId`, passed as `--chain-id`. Set literally in `docker-compose.yml` (Base 8453, Somnia 5031, both queried live via `eth_chainId`), not in `.env`. Redundant for the current forks: anvil already inherits the chain id from the chain it forks, so it would report the same value without this flag. It is passed to keep the value explicit in compose rather than implicit in whatever the upstream RPC answers. Named `EVM_CHAIN_ID` rather than `CHAIN_ID` because `CHAIN_ID` already names the Cosmos chain id on the `edgenet` service. Required by the script; must be a positive integer. |
 | `ANVIL_PORT` | Port anvil listens on **inside the container**. The host port comes from the compose `ports:` mapping, which is a separate setting. They happen to match one to one today (8545 and 8546), and keeping them matched is the sane convention, but nothing enforces it. |
 
 ## Adding an EVM chain
 
-Two `.env` entries and one compose block. No new Dockerfile.
+One `<NAME>_FORK_RPC_URL` line and one `<NAME>_FORK_BLOCK` line in `.env`, plus one service block in `docker-compose.yml` carrying `CHAIN_NAME`, `BLOCK_TIME`, `EVM_CHAIN_ID` and `ANVIL_PORT` as literals. No new Dockerfile.
 
 1. Add the upstream RPC URL and the fork block height to `.env` (and to `.env.example`):
 
@@ -165,9 +167,9 @@ Two `.env` entries and one compose block. No new Dockerfile.
    ARBITRUM_FORK_BLOCK=
    ```
 
-   Leave `ARBITRUM_FORK_BLOCK` empty to fork the chain tip, or set it to a pinned block number.
+   Leave `ARBITRUM_FORK_BLOCK` empty to fork the chain tip, or set it to a pinned block number. `BLOCK_TIME` and `EVM_CHAIN_ID` do not go in `.env`; see the next step.
 
-2. Add a service block to `docker-compose.yml`, picking a free port:
+2. Add a service block to `docker-compose.yml`, picking a free port. `BLOCK_TIME` (whole seconds) and `EVM_CHAIN_ID` are facts about the chain being forked, not deployment configuration, so they are set as literals here, the same way `CHAIN_NAME` already is; look up the chain's real block time and query its real chain id via `eth_chainId` rather than guessing:
 
    ```yaml
    anvil-arbitrum:
@@ -177,10 +179,14 @@ Two `.env` entries and one compose block. No new Dockerfile.
      build:
        context: .
        dockerfile: Dockerfile.anvil
+     # BLOCK_TIME is whole seconds (anvil's -b flag). EVM_CHAIN_ID is
+     # Arbitrum One's real chain id, not an arbitrary value.
      environment:
        - CHAIN_NAME=arbitrum
        - FORK_RPC_URL=${ARBITRUM_FORK_RPC_URL}
        - FORK_BLOCK=${ARBITRUM_FORK_BLOCK}
+       - BLOCK_TIME=1
+       - EVM_CHAIN_ID=42161
        - ANVIL_PORT=8547
      ports:
        - 8547:8547
@@ -189,7 +195,7 @@ Two `.env` entries and one compose block. No new Dockerfile.
      restart: on-failure
    ```
 
-   Keep `ANVIL_PORT` and the `ports:` mapping in agreement.
+   Keep `ANVIL_PORT` and the `ports:` mapping in agreement. `BLOCK_TIME` and `EVM_CHAIN_ID` are both required by `scripts/anvil-fork.sh`; a missing, non positive integer, or quote containing value is fatal before anvil starts.
 
 3. Optionally add `anvil-arbitrum-start`, `anvil-arbitrum-stop` and `anvil-arbitrum-logs` targets to the `Makefile`, mirroring the existing ones.
 
@@ -223,6 +229,8 @@ Because `CHAIN_HOME` is a bind mount (`./.config/${CHAIN_ID}_edgenet/`), the sen
 
 `scripts/anvil-fork.sh` is the entrypoint of every anvil container. If `FORK_BLOCK` is set to a positive integer, it execs anvil with `--fork-url` and `--fork-block-number` pinned to that value. If `FORK_BLOCK` is empty or unset, it execs anvil with `--fork-url` only, so anvil forks the upstream chain's current tip. A non-integer `FORK_BLOCK` is fatal before anvil starts.
 
+Both branches also pass `--block-time "$BLOCK_TIME"` and `--chain-id "$EVM_CHAIN_ID"`. Both are required: a missing, non-positive-integer, or quote-containing value is fatal before anvil starts, same as a malformed `FORK_BLOCK`. Without `--block-time`, anvil auto-mines a block on every transaction and produces no empty blocks, so an idle fork never advances; with it, the fork ticks on a fixed interval like a real chain. `--chain-id` is a weaker case and is worth stating plainly: anvil already inherits the chain id from the chain it forks, so a fork of Base reports 8453 over `eth_chainId` with or without the flag, and passing `EVM_CHAIN_ID` changes nothing observable today. It is passed because it makes the value explicit and reviewable in `docker-compose.yml` instead of implicit in whatever the upstream RPC happens to answer, and because it keeps the fork's identity pinned if `FORK_RPC_URL` is ever repointed at a proxy, a testnet, or an endpoint that answers differently. Both values are hardcoded per service in `docker-compose.yml` (`anvil-base`: 2 seconds and chain id 8453; `anvil-somnia`: 1 second and chain id 5031), not sourced from `.env`, because they are facts about the upstream chain rather than deployment configuration; the chain ids were queried live from each RPC endpoint via `eth_chainId`. Deliberately not overridden: anvil already inherits gas limit, base fee, hardfork and code size limit from the forked chain, and its own defaults for transaction ordering and epoch length are already realistic, so none of those were touched. One caveat: anvil's block time only accepts whole seconds, so `anvil-somnia`, whose real block time is well under a second, still ticks slower than the real chain; see [DEVELOPER.md](DEVELOPER.md#7-known-gaps-and-cleanup-backlog) for this and other known gaps.
+
 There is no lookup against the Lumen snapshot: the fork height and the snapshot are configured independently, see [Anvil forks](#anvil-forks) above for what that means for keeping them consistent.
 
 There is an offline self-test that exercises the entrypoint's argument handling and its environment validation, with no network access and no extra tooling:
@@ -252,6 +260,9 @@ Free 26657, 1317, 9090, 8545 or 8546, or change the `ports:` mapping in `docker-
 
 **Anvil exits with `FORK_BLOCK must be a positive integer block number`.**
 `BASE_FORK_BLOCK` or `SOMNIA_FORK_BLOCK` is set to something other than a positive integer. Leave it empty to fork the chain tip, or set it to a plain block number.
+
+**Anvil exits with `BLOCK_TIME must be a positive integer` or `EVM_CHAIN_ID must be a positive integer`.**
+`BLOCK_TIME` and `EVM_CHAIN_ID` are literals in `docker-compose.yml`, not `.env` values, so this points at an edit made there (or at a new service added while [adding an EVM chain](#adding-an-evm-chain)) rather than at anything in `.env`. Both must be plain positive integers.
 
 **The node fails to fetch snapshot metadata, or complains the response is not JSON.**
 `SNAPSHOT_URL` must point at a snapshot metadata endpoint (one that returns JSON with `.url` and `.height`), not at an archive file directly. If your `.env` predates this change, it may still hold the old `/download` archive URL; that form is rejected. Point it at a metadata endpoint instead, for example `https://snapshot.lumen.euclidprotocol.com/api/snapshots/latest` or a pinned `https://snapshot.lumen.euclidprotocol.com/api/snapshots/<height>`.

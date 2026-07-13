@@ -9,6 +9,12 @@
 #   CHAIN_NAME    Name of the target chain (logging only)
 #   FORK_RPC_URL  JSON-RPC endpoint of the target chain
 #   ANVIL_PORT    Port for anvil to listen on
+#   BLOCK_TIME    Seconds between blocks. Without it anvil auto-mines a block
+#                 per transaction and never produces an empty block, which no
+#                 real chain does.
+#   EVM_CHAIN_ID  EVM chain id anvil reports over eth_chainId. Not inherited
+#                 from the fork, so it must be given explicitly (Base mainnet
+#                 8453, Somnia mainnet 5031).
 #
 # Optional environment:
 #   FORK_BLOCK    Block number to fork at. When empty or unset, anvil
@@ -37,22 +43,31 @@ require_env() {
 # --- main ---------------------------------------------------------------------
 
 main() {
-  require_env CHAIN_NAME FORK_RPC_URL ANVIL_PORT
+  require_env CHAIN_NAME FORK_RPC_URL ANVIL_PORT BLOCK_TIME EVM_CHAIN_ID
+
+  [[ "$BLOCK_TIME" =~ ^[1-9][0-9]*$ ]] \
+    || die "BLOCK_TIME must be a positive integer number of seconds, got '$BLOCK_TIME'"
+  [[ "$EVM_CHAIN_ID" =~ ^[1-9][0-9]*$ ]] \
+    || die "EVM_CHAIN_ID must be a positive integer chain id, got '$EVM_CHAIN_ID'"
 
   if [[ -n "${FORK_BLOCK:-}" ]]; then
     [[ "$FORK_BLOCK" =~ ^[1-9][0-9]*$ ]] \
       || die "FORK_BLOCK must be a positive integer block number, got '$FORK_BLOCK'"
-    log "forking '$CHAIN_NAME' at pinned block $FORK_BLOCK"
+    log "forking '$CHAIN_NAME' (chain id $EVM_CHAIN_ID) at pinned block $FORK_BLOCK, mining every ${BLOCK_TIME}s"
     exec anvil \
       --fork-url "$FORK_RPC_URL" \
       --fork-block-number "$FORK_BLOCK" \
+      --block-time "$BLOCK_TIME" \
+      --chain-id "$EVM_CHAIN_ID" \
       --host 0.0.0.0 \
       --port "$ANVIL_PORT"
   fi
 
-  log "FORK_BLOCK is not set; forking '$CHAIN_NAME' at the chain tip"
+  log "FORK_BLOCK is not set; forking '$CHAIN_NAME' (chain id $EVM_CHAIN_ID) at the chain tip, mining every ${BLOCK_TIME}s"
   exec anvil \
     --fork-url "$FORK_RPC_URL" \
+    --block-time "$BLOCK_TIME" \
+    --chain-id "$EVM_CHAIN_ID" \
     --host 0.0.0.0 \
     --port "$ANVIL_PORT"
 }

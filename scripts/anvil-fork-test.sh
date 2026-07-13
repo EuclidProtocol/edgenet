@@ -56,7 +56,8 @@ run_entrypoint() {
 # --- tests ------------------------------------------------------------------------
 
 # 1. FORK_BLOCK unset: anvil forks at the chain tip, no --fork-block-number.
-run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 \
+  BLOCK_TIME=2 EVM_CHAIN_ID=8453
 assert_eq 0 "$RUN_RC" "tip mode: entrypoint execs anvil successfully"
 if [[ "$RUN_OUT" != *"arg:--fork-block-number"* ]]; then
   pass "tip mode: no --fork-block-number flag"
@@ -78,10 +79,31 @@ if [[ "$RUN_OUT" == *"chain tip"* ]]; then
 else
   fail "tip mode: log announces chain-tip mode (got: $RUN_OUT)"
 fi
+# Without --block-time anvil mines only on transactions and never produces an
+# empty block, so the flag has to reach anvil on this branch too, not just the
+# pinned one.
+if [[ "$RUN_OUT" == *"arg:--block-time
+arg:2"* ]]; then
+  pass "tip mode: --block-time 2 is passed"
+else
+  fail "tip mode: --block-time 2 is passed (got: $RUN_OUT)"
+fi
+if [[ "$RUN_OUT" == *"arg:--chain-id
+arg:8453"* ]]; then
+  pass "tip mode: --chain-id 8453 is passed"
+else
+  fail "tip mode: --chain-id 8453 is passed (got: $RUN_OUT)"
+fi
+if [[ "$RUN_OUT" == *"chain id 8453"* && "$RUN_OUT" == *"every 2s"* ]]; then
+  pass "tip mode: log announces the chain id and the block time"
+else
+  fail "tip mode: log announces the chain id and the block time (got: $RUN_OUT)"
+fi
 
 # 2. FORK_BLOCK set but empty: same as unset (compose passes empty strings
 #    for undefined .env vars, so empty must mean tip, not an error).
-run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 FORK_BLOCK=
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 \
+  BLOCK_TIME=2 EVM_CHAIN_ID=8453 FORK_BLOCK=
 assert_eq 0 "$RUN_RC" "empty FORK_BLOCK: entrypoint execs anvil successfully"
 if [[ "$RUN_OUT" != *"arg:--fork-block-number"* && "$RUN_OUT" == *"chain tip"* ]]; then
   pass "empty FORK_BLOCK: treated as chain tip"
@@ -90,7 +112,8 @@ else
 fi
 
 # 3. FORK_BLOCK set: the flag is passed with exactly that value.
-run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 FORK_BLOCK=12345678
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 \
+  BLOCK_TIME=2 EVM_CHAIN_ID=8453 FORK_BLOCK=12345678
 assert_eq 0 "$RUN_RC" "pinned mode: entrypoint execs anvil successfully"
 if [[ "$RUN_OUT" == *"arg:--fork-block-number
 arg:12345678"* ]]; then
@@ -103,10 +126,42 @@ if [[ "$RUN_OUT" == *"pinned block 12345678"* ]]; then
 else
   fail "pinned mode: log announces the pinned height (got: $RUN_OUT)"
 fi
+# The two branches are separate `exec anvil` lines, so both need asserting.
+if [[ "$RUN_OUT" == *"arg:--block-time
+arg:2"* ]]; then
+  pass "pinned mode: --block-time 2 is passed"
+else
+  fail "pinned mode: --block-time 2 is passed (got: $RUN_OUT)"
+fi
+if [[ "$RUN_OUT" == *"arg:--chain-id
+arg:8453"* ]]; then
+  pass "pinned mode: --chain-id 8453 is passed"
+else
+  fail "pinned mode: --chain-id 8453 is passed (got: $RUN_OUT)"
+fi
+if [[ "$RUN_OUT" == *"chain id 8453"* && "$RUN_OUT" == *"every 2s"* ]]; then
+  pass "pinned mode: log announces the chain id and the block time"
+else
+  fail "pinned mode: log announces the chain id and the block time (got: $RUN_OUT)"
+fi
+
+# 3b. The values are read from the environment, not hard coded: a second chain
+#     (Somnia) gets its own chain id and block time.
+run_entrypoint CHAIN_NAME=somnia FORK_RPC_URL=http://rpc.example ANVIL_PORT=8546 \
+  BLOCK_TIME=1 EVM_CHAIN_ID=5031
+assert_eq 0 "$RUN_RC" "somnia: entrypoint execs anvil successfully"
+if [[ "$RUN_OUT" == *"arg:--block-time
+arg:1"* && "$RUN_OUT" == *"arg:--chain-id
+arg:5031"* ]]; then
+  pass "somnia: --block-time 1 and --chain-id 5031 are passed"
+else
+  fail "somnia: --block-time 1 and --chain-id 5031 are passed (got: $RUN_OUT)"
+fi
 
 # 4. Malformed FORK_BLOCK is fatal before anvil starts.
 for bad in not-a-number -5 1.5 0 0x10; do
-  run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 FORK_BLOCK="$bad"
+  run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 \
+    BLOCK_TIME=2 EVM_CHAIN_ID=8453 FORK_BLOCK="$bad"
   if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *"positive integer block number"* ]]; then
     pass "FORK_BLOCK=$bad is fatal"
   else
@@ -119,12 +174,71 @@ for bad in not-a-number -5 1.5 0 0x10; do
   fi
 done
 
+# 4b. Malformed BLOCK_TIME / EVM_CHAIN_ID are fatal before anvil starts, on the
+#     same terms as FORK_BLOCK. A hex chain id is the interesting one: it is how
+#     eth_chainId reports the value, and anvil would reject it.
+for bad in not-a-number -5 1.5 0 0x10; do
+  run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 \
+    BLOCK_TIME="$bad" EVM_CHAIN_ID=8453
+  if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *"positive integer number of seconds"* ]]; then
+    pass "BLOCK_TIME=$bad is fatal"
+  else
+    fail "BLOCK_TIME=$bad is fatal (rc=$RUN_RC, got: $RUN_OUT)"
+  fi
+  if [[ "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
+    pass "BLOCK_TIME=$bad dies before anvil starts"
+  else
+    fail "BLOCK_TIME=$bad dies before anvil starts (anvil was invoked)"
+  fi
+
+  run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 \
+    BLOCK_TIME=2 EVM_CHAIN_ID="$bad"
+  if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *"positive integer chain id"* ]]; then
+    pass "EVM_CHAIN_ID=$bad is fatal"
+  else
+    fail "EVM_CHAIN_ID=$bad is fatal (rc=$RUN_RC, got: $RUN_OUT)"
+  fi
+  if [[ "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
+    pass "EVM_CHAIN_ID=$bad dies before anvil starts"
+  else
+    fail "EVM_CHAIN_ID=$bad dies before anvil starts (anvil was invoked)"
+  fi
+done
+
 # 5. Missing required env is fatal.
-run_entrypoint CHAIN_NAME=base ANVIL_PORT=8545
+run_entrypoint CHAIN_NAME=base ANVIL_PORT=8545 BLOCK_TIME=2 EVM_CHAIN_ID=8453
 if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *FORK_RPC_URL* && "$RUN_OUT" == *"is not set"* ]]; then
   pass "missing FORK_RPC_URL is fatal and names the variable"
 else
   fail "missing FORK_RPC_URL is fatal and names the variable (rc=$RUN_RC, got: $RUN_OUT)"
+fi
+
+# 5b. BLOCK_TIME and EVM_CHAIN_ID are required, not defaulted: an unset one must
+#     stop the boot rather than let anvil fall back to instant-mining or its own
+#     chain id. Compose ships an undefined .env var as an empty string, so empty
+#     has to be fatal too.
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 EVM_CHAIN_ID=8453
+if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *BLOCK_TIME* && "$RUN_OUT" == *"is not set"* \
+  && "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
+  pass "missing BLOCK_TIME is fatal before anvil starts and names the variable"
+else
+  fail "missing BLOCK_TIME is fatal before anvil starts and names the variable (rc=$RUN_RC, got: $RUN_OUT)"
+fi
+
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 BLOCK_TIME=2
+if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *EVM_CHAIN_ID* && "$RUN_OUT" == *"is not set"* \
+  && "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
+  pass "missing EVM_CHAIN_ID is fatal before anvil starts and names the variable"
+else
+  fail "missing EVM_CHAIN_ID is fatal before anvil starts and names the variable (rc=$RUN_RC, got: $RUN_OUT)"
+fi
+
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 \
+  BLOCK_TIME= EVM_CHAIN_ID=
+if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *"is not set"* && "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
+  pass "empty BLOCK_TIME/EVM_CHAIN_ID are fatal before anvil starts"
+else
+  fail "empty BLOCK_TIME/EVM_CHAIN_ID are fatal before anvil starts (rc=$RUN_RC, got: $RUN_OUT)"
 fi
 
 # 6. Quoted env values. A quote-preserving .env parse ships FORK_RPC_URL as
@@ -154,7 +268,8 @@ fi
 
 # The whole point is to fail before anvil dials out: a quoted FORK_RPC_URL
 # through the real entrypoint must die without invoking anvil.
-run_entrypoint CHAIN_NAME=base FORK_RPC_URL='"http://rpc.example"' ANVIL_PORT=8545
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL='"http://rpc.example"' ANVIL_PORT=8545 \
+  BLOCK_TIME=2 EVM_CHAIN_ID=8453
 if (( RUN_RC != 0 )); then
   pass "quoted FORK_RPC_URL: entrypoint exits non-zero"
 else
@@ -169,6 +284,26 @@ if [[ "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
   pass "quoted FORK_RPC_URL: dies before anvil starts"
 else
   fail "quoted FORK_RPC_URL: dies before anvil starts (anvil was invoked)"
+fi
+
+# BLOCK_TIME and EVM_CHAIN_ID are in require_env, so the same quote guard covers
+# them: a quoted "2" would otherwise reach anvil as a literal-quoted argument.
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 \
+  BLOCK_TIME='"2"' EVM_CHAIN_ID=8453
+if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *"literal quote character"* && "$RUN_OUT" == *BLOCK_TIME* \
+  && "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
+  pass "quoted BLOCK_TIME: rejected by the quote guard before anvil starts"
+else
+  fail "quoted BLOCK_TIME: rejected by the quote guard before anvil starts (rc=$RUN_RC, got: $RUN_OUT)"
+fi
+
+run_entrypoint CHAIN_NAME=base FORK_RPC_URL=http://rpc.example ANVIL_PORT=8545 \
+  BLOCK_TIME=2 EVM_CHAIN_ID="'8453'"
+if (( RUN_RC != 0 )) && [[ "$RUN_OUT" == *"literal quote character"* && "$RUN_OUT" == *EVM_CHAIN_ID* \
+  && "$RUN_OUT" != *ANVIL_WAS_INVOKED* ]]; then
+  pass "quoted EVM_CHAIN_ID: rejected by the quote guard before anvil starts"
+else
+  fail "quoted EVM_CHAIN_ID: rejected by the quote guard before anvil starts (rc=$RUN_RC, got: $RUN_OUT)"
 fi
 
 # 7. edgenet.sh guards the same failure mode on its own vars. HOME is a throwaway
@@ -341,7 +476,10 @@ run_edgenet() {
   EDGENET_HOME=$(mktemp -d "$fake_home/run.XXXXXX")
   EDGENET_LOG="$EDGENET_HOME/calls.log"
   : >"$EDGENET_LOG"
+  # Dockerfile.edgenet bakes both of these into $HOME; edgenet.sh copies them into
+  # CONFIG_FOLDER, so a fake HOME missing either one fails the setup path at the cp.
   echo '{}' >"$EDGENET_HOME/genesis.json"
+  : >"$EDGENET_HOME/config.toml"
   mkdir -p "$EDGENET_HOME/.lumend"
   "$@" # caller may seed CHAIN_HOME (e.g. drop the sentinel in) before the run
   EDGENET_RC=0
