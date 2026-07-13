@@ -28,7 +28,7 @@ make edgenet
 
 Watch it come up with `make edgenet-logs`. The first run is slow because it downloads the snapshot into `cache/`. Later runs reuse the cached archive.
 
-> **Copy `.env.example` to `.env` before anything else.** The Makefile uses `-include .env`, so a missing `.env` is not an error. Make proceeds with every variable empty, and the build fails much later with a confusing message (an empty `BINARY` turns the binary download URL into nonsense). If a first build fails in a way that makes no sense, check that `.env` exists.
+> **Copy `.env.example` to `.env` before anything else.** Compose loads `./.env` on its own, so a missing `.env` is not a hard error. Every variable comes through as an empty string instead, Compose prints a warning like `The "BINARY" variable is not set. Defaulting to a blank string.` for each one, and the build fails much later with a confusing message (an empty `BINARY` turns the binary download URL into nonsense). If a first build fails in a way that makes no sense, check that `.env` exists.
 
 Once the stack is up:
 
@@ -109,7 +109,7 @@ make clean           # remove .config/ (chain data). The snapshot cache in cache
 
 ## Configuration
 
-All configuration lives in `.env`, copied from `.env.example`. The Makefile exports it to compose.
+All configuration lives in `.env`, copied from `.env.example`. Compose loads it natively; the Makefile does not touch it.
 
 ### Lumen node
 
@@ -225,7 +225,7 @@ See DEVELOPER.md for what it covers.
 ## Troubleshooting
 
 **The build fails with a strange URL error, or `BINARY` looks empty.**
-You probably have no `.env`. The Makefile uses `-include .env`, which does not complain when the file is absent. Run `cp .env.example .env` and fill it in.
+You probably have no `.env`. Compose loads `./.env` on its own and does not treat a missing file as an error, it just interpolates every variable as an empty string and warns about each one (`The "BINARY" variable is not set. Defaulting to a blank string.`). Run `cp .env.example .env` and fill it in. See [DEVELOPER.md](DEVELOPER.md#8-troubleshooting) if the failure looks like a quoted value instead of an empty one.
 
 **`exec format error`, or the binary download 404s.**
 `PLATFORM` does not match your machine. Use `arm64` on Apple Silicon, `x86_64` on Intel and on most Linux hosts. Then rebuild with `make build`.

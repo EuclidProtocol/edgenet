@@ -24,10 +24,18 @@ set -euo pipefail
 log() { printf '[anvil-fork] %s\n' "$*" >&2; }
 die() { log "FATAL: $*"; exit 1; }
 
+# Requires each named variable to be set and free of literal quote characters.
+# A quote survives expansion (bash never strips quotes from an expansion
+# result), so a quoted .env value silently corrupts every URL and path built
+# from it; fail loudly here instead.
 require_env() {
-  local name
+  local name value
   for name in "$@"; do
     [[ -n "${!name:-}" ]] || die "required environment variable $name is not set"
+    value=${!name}
+    if [[ "$value" == *[\"\']* ]]; then
+      die "environment variable $name contains a literal quote character: $value -- this usually means the value is quoted in .env; remove the surrounding quotes"
+    fi
   done
 }
 

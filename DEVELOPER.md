@@ -442,12 +442,14 @@ None of these are blocking. All of them are real.
   `.env.example` at all, even though `scripts/edgenet.sh` reads it from the
   environment like every other setting. It should either be a `.env` variable
   like the rest, or the script should default it.
-* **`-include .env` fails quietly.** The `Makefile` starts with `-include .env`,
-  where the leading `-` tells Make to ignore a missing file. If you forget to
-  create `.env`, Make does not complain. Instead every variable is empty, and you
-  get a confusing downstream failure from Compose (empty image names, empty mount
-  paths) rather than a clear "you have no .env". A guard target that checks for
-  the file and errors with a useful message would be a real improvement.
+* **A missing `.env` still fails late rather than loudly.** Compose loads
+  `./.env` natively and does not treat an absent file as an error. Every
+  variable interpolates to an empty string, Compose warns once per variable,
+  and the build fails much later with a confusing message (an empty `BINARY`
+  turns the binary download URL into nonsense). A guard target that checks for
+  the file and errors with a useful message would be a real improvement. The
+  `Makefile` no longer parses or exports `.env` itself, which is what used to
+  turn this from a late failure into a corrupted one (see section 8).
 * **`.gitignore` has stale entries.** It ignores `logs/` and `*.log`, but nothing
   in the repository writes to either. Logs go to the Docker daemon and are read
   back with `docker compose logs`.
@@ -466,3 +468,56 @@ None of these are blocking. All of them are real.
   really does return the latest snapshot's metadata (in which case the comment is
   stale) or the example value is wrong. Confirm against the live API before
   trusting either.
+
+## 8. Troubleshooting
+
+### Recovering from quote poisoned `.env` values
+
+Grep for either of these two error strings if a deployment looks broken in a way
+that does not match its configuration.
+
+**`edgenet` container:**
+
+```
+rm: can't remove '/"lumend"/."lumend"': Resource busy
+```
+
+This means `BINARY` reached the container as `"lumend"`, quotes included, rather
+than `lumend`. The quoted value was baked into `ENV HOME` at image build time
+(section 5), and Compose mounts a host volume at that same quote laden path
+(section 3, step 1), so the entrypoint's own cleanup step collides with the
+mount instead of removing it cleanly.
+
+**anvil containers (`anvil-base`, `anvil-somnia`):**
+
+```
+curl: (3) URL rejected: Port number was not a decimal number between 0 and 65535
+```
+
+This means `SNAPSHOT_API_URL` reached the container as a quoted string, and curl
+parsed the trailing quote as part of what it expected to be a port number.
+
+Both symptoms share one root cause. The `Makefile` used to begin with `-include
+.env` plus a bare `export`. GNU Make parses `.env` as makefile syntax, not as a
+dotenv file, so a double quoted value such as `BINARY="lumend"` kept its literal
+quotes when Make read it. The `export` then pushed that quoted value into the
+process environment that `docker compose` inherits, and an inherited environment
+variable outranks Compose's own `.env` parsing, which strips quotes correctly on
+its own. Compose was never the problem. Make was. The `Makefile` no longer reads
+or exports `.env` at all, `.env.example` values are unquoted, and both
+entrypoints now reject any value containing a quote character.
+
+A deployment that last built while that combination was in place carries a
+poisoned image layer as well as a poisoned environment, because the quoted
+`BINARY` was baked into `ENV HOME` at build time. Fixing `.env` alone is not
+enough. The image has to be rebuilt too. Recover in this order.
+
+1. `make edgenet-down` to stop the poisoned containers.
+2. Remove the quote named host directory under `.config/`. Because `CHAIN_ID`
+   was also quoted, the directory is literally named `"lumen-1"_edgenet`,
+   quotes included in the filename, not the expected `lumen-1_edgenet`.
+3. Edit the existing `.env` and remove the quotes from every value.
+4. Rebuild with `make edgenet` (or any target that passes `--build`). The bad
+   `BINARY` value was baked into the image layer at `ENV HOME`, so a plain
+   restart without a rebuild reuses that layer and reproduces the same
+   failure.

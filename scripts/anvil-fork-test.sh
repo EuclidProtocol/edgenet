@@ -186,6 +186,112 @@ epoch=$(extract_target_ts '{"blockTime": "2026-07-13T10:00:00.000Z"}')
 roundtrip=$(jq -rn --argjson e "$epoch" '$e | todate')
 assert_eq "2026-07-13T10:00:00Z" "$roundtrip" "blockTime with millis parses to correct epoch"
 
+# 8. Quoted env values. A quote-preserving .env parse ships SNAPSHOT_API_URL as
+#    the literal string "https://.../api" (quotes included), which bash never
+#    strips, so curl sees a URL it cannot parse. require_env must reject it.
+QUOTED_URL='"https://snapshots.example/api"'
+QUOTED_DENOM="'usync'"
+PLAIN_URL='https://snapshots.example/api'
+
+expect_die "double-quoted value is rejected" "literal quote character" \
+  require_env QUOTED_URL
+expect_die "double-quoted value names the offending var" "QUOTED_URL" \
+  require_env QUOTED_URL
+expect_die "double-quoted value shows the value" "$QUOTED_URL" \
+  require_env QUOTED_URL
+expect_die "error blames a quoted value in .env" "quoted in .env" \
+  require_env QUOTED_URL
+expect_die "single-quoted value is rejected" "literal quote character" \
+  require_env QUOTED_DENOM
+
+if ( require_env PLAIN_URL ) 2>/dev/null; then
+  pass "unquoted value is accepted"
+else
+  fail "unquoted value is accepted (require_env rejected a clean value)"
+fi
+
+# The whole point is to fail before the network: stub curl so any invocation
+# announces itself, then assert the run died without one.
+stub_dir=$(mktemp -d)
+trap 'rm -rf "$stub_dir"' EXIT
+printf '#!/bin/sh\necho CURL_WAS_INVOKED\nexit 0\n' >"$stub_dir/curl"
+chmod +x "$stub_dir/curl"
+
+rc=0
+out=$(PATH="$stub_dir:$PATH" \
+  CHAIN_NAME=base FORK_RPC_URL=http://rpc.example BLOCK_TIME_MS=2000 \
+  SNAPSHOT_API_URL='"https://snapshots.example/api"' ANVIL_PORT=8545 \
+  bash "$SCRIPT_DIR/anvil-fork.sh" 2>&1) || rc=$?
+
+if (( rc != 0 )); then
+  pass "quoted SNAPSHOT_API_URL: entrypoint exits non-zero"
+else
+  fail "quoted SNAPSHOT_API_URL: entrypoint exits non-zero (exited 0)"
+fi
+if [[ "$out" == *"literal quote character"* && "$out" == *SNAPSHOT_API_URL* ]]; then
+  pass "quoted SNAPSHOT_API_URL: error names the variable and the cause"
+else
+  fail "quoted SNAPSHOT_API_URL: error names the variable and the cause (got: $out)"
+fi
+if [[ "$out" != *CURL_WAS_INVOKED* ]]; then
+  pass "quoted SNAPSHOT_API_URL: dies before any curl runs"
+else
+  fail "quoted SNAPSHOT_API_URL: dies before any curl runs (curl was invoked)"
+fi
+
+# 9. edgenet.sh guards the same failure mode on its own vars. HOME is a throwaway
+#    dir so a regression that reaches the `rm -rf $CHAIN_HOME/` cannot touch
+#    anything real.
+fake_home=$(mktemp -d)
+trap 'rm -rf "$stub_dir" "$fake_home"' EXIT
+
+rc=0
+out=$(HOME="$fake_home" BINARY='"lumend"' CHAIN_ID=edgenet-1 \
+  SNAPSHOT_URL=https://snapshots.example/s.tar.lz4 \
+  bash "$SCRIPT_DIR/edgenet.sh" 2>&1) || rc=$?
+
+if (( rc != 0 )) && [[ "$out" == *"literal quote character"* && "$out" == *BINARY* ]]; then
+  pass "edgenet.sh: quoted BINARY is rejected before any teardown"
+else
+  fail "edgenet.sh: quoted BINARY is rejected before any teardown (rc=$rc, got: $out)"
+fi
+
+# 10. Stale image: HOME is baked into the layer as `ENV HOME /${BINARY}`, so an
+#     image built while BINARY was quoted carries HOME=/"lumend" even after .env
+#     is cleaned up. Every var below is clean, so the .env loop passes and only
+#     the HOME check stands between this run and `rm -rf $CHAIN_HOME/`.
+#     CHAIN_HOME lands inside the temp dir; a sentinel there proves the teardown
+#     never ran, rather than merely trusting the exit code.
+stale_home="$fake_home/\"lumend\""
+mkdir -p "$stale_home/.lumend"
+: >"$stale_home/.lumend/sentinel"
+
+rc=0
+out=$(HOME="$stale_home" BINARY=lumend CHAIN_ID=edgenet-1 DENOM=ualpha STAKE_DENOM=usync \
+  SNAPSHOT_URL=https://snapshots.example/s.tar.lz4 \
+  bash "$SCRIPT_DIR/edgenet.sh" 2>&1) || rc=$?
+
+if (( rc != 0 )); then
+  pass "stale image: quoted HOME exits non-zero despite a clean .env"
+else
+  fail "stale image: quoted HOME exits non-zero despite a clean .env (exited 0)"
+fi
+if [[ -f "$stale_home/.lumend/sentinel" ]]; then
+  pass "stale image: quoted HOME dies before the rm -rf teardown"
+else
+  fail "stale image: quoted HOME dies before the rm -rf teardown (CHAIN_HOME was wiped)"
+fi
+if [[ "$out" == *HOME* && "$out" == *"Rebuild the image"* ]]; then
+  pass "stale image: error points at rebuilding the image"
+else
+  fail "stale image: error points at rebuilding the image (got: $out)"
+fi
+if [[ "$out" != *"remove the surrounding quotes"* ]]; then
+  pass "stale image: error does not misdirect to .env"
+else
+  fail "stale image: error does not misdirect to .env (blamed .env instead)"
+fi
+
 # --- summary --------------------------------------------------------------------
 
 echo

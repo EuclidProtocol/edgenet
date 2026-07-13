@@ -1,6 +1,4 @@
--include .env
-export
-
+# Docker Compose loads ./.env itself; Make must not parse or export it.
 COMPOSE := DOCKER_BUILDKIT=1 docker compose --profile edgenet
 
 .PHONY: edgenet edgenet-up edgenet-stop edgenet-down edgenet-logs build clean \
