@@ -46,6 +46,22 @@ edit_client () {
     dasel put -t string -f $CONFIG_FOLDER/client.toml '.chain-id' -v $CHAIN_ID
 }
 
+# CHAIN_HOME is a bind mount (docker-compose.yml maps ./.config/${CHAIN_ID}_edgenet/
+# onto it), so this sentinel outlives the container. Its presence means the chain was
+# already built here: skip the whole setup path and just start the node again, instead
+# of wiping the home and rebuilding the chain from the snapshot on every restart.
+if [ -f "$CHAIN_HOME/initialized" ]; then
+    echo "♻️  Existing chain found at $CHAIN_HOME (initialized), skipping setup."
+    echo "🏁 Starting $CHAIN_ID from existing state..."
+    exec $BINARY start --home $CHAIN_HOME \
+        --rpc.laddr tcp://0.0.0.0:26657 \
+        --api.enable true \
+        --api.swagger true \
+        --api.enabled-unsafe-cors true
+fi
+
+echo "🆕 No existing chain at $CHAIN_HOME, building it from the snapshot."
+
 # Clear the CONTENTS of the home directory, not the directory itself.
 # docker-compose.yml bind-mounts a host directory at /${BINARY}/.${BINARY}/, which
 # is exactly CHAIN_HOME. A live mountpoint cannot be unlinked from inside the
@@ -133,6 +149,13 @@ echo "♻️  Restoring snapshot at height $SNAPSHOT_HEIGHT"
 
 lz4 -dc $SNAPSHOT_FILE | tar -C $CHAIN_HOME/ -xf -
 
+
+# Written before in-place-testnet because in-place-testnet never returns (it converts
+# the restored state and then runs the node), so there is no "after" to write it in.
+# Accepted tradeoff: a conversion that dies partway leaves this sentinel over a
+# half-converted home and the next restart will `start` against it. Escape hatch:
+# `make clean`, or delete $CHAIN_HOME/initialized, to force a rebuild from scratch.
+touch "$CHAIN_HOME/initialized"
 
 echo "🏁 Starting $CHAIN_ID..."
 $BINARY in-place-testnet $CHAIN_ID $VALIDATOR_ADDRESS \

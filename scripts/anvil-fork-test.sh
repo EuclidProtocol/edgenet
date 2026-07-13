@@ -224,6 +224,172 @@ else
   fail "stale image: error does not misdirect to .env (blamed .env instead)"
 fi
 
+# 9. Restart behaviour. edgenet.sh writes $CHAIN_HOME/initialized before handing off
+#    to in-place-testnet; a home carrying that sentinel must skip setup entirely and
+#    just start the node. Stubs stand in for everything the script shells out to, so
+#    the setup path can run to completion without a network or a real chain binary.
+edgenet_stub_dir=$(mktemp -d)
+trap 'rm -rf "$stub_dir" "$fake_home" "$edgenet_stub_dir"' EXIT
+
+# The chain binary logs its argv to $EDGENET_LOG. `init` creates the config dir the
+# real one would; `keys show` prints an address; `in-place-testnet` additionally
+# records whether the sentinel already existed when it was invoked.
+cat >"$edgenet_stub_dir/lumend" <<'STUB'
+#!/bin/sh
+echo "BINARY_INVOKED:$*" >>"$EDGENET_LOG"
+case "$1" in
+  init)
+    cat >/dev/null
+    mkdir -p "$HOME/.lumend/config"
+    ;;
+  keys)
+    # Only `keys add` is fed a mnemonic on stdin; `keys show` must not read at all
+    # (it runs in a command substitution and would block on the caller's stdin).
+    [ "$2" = "add" ] && cat >/dev/null
+    [ "$2" = "show" ] && echo euclid1validatoraddressstub
+    ;;
+  in-place-testnet)
+    if [ -f "$HOME/.lumend/initialized" ]; then
+      echo "SENTINEL_PRESENT_AT_CONVERT" >>"$EDGENET_LOG"
+    else
+      echo "SENTINEL_MISSING_AT_CONVERT" >>"$EDGENET_LOG"
+    fi
+    ;;
+esac
+exit 0
+STUB
+chmod +x "$edgenet_stub_dir/lumend"
+
+# curl logs every call. A restart must not make one at all, so the log doubles as
+# the network-silence assertion. Serves snapshot metadata, and writes a file for the
+# archive download so the `mv` of the .part file succeeds.
+cat >"$edgenet_stub_dir/curl" <<'STUB'
+#!/bin/sh
+echo "CURL_INVOKED:$*" >>"$EDGENET_LOG"
+out=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) out=$2; shift ;;
+  esac
+  shift
+done
+if [ -n "$out" ]; then
+  echo snapshot-bytes >"$out"
+else
+  echo '{"height":25667070,"url":"https://snapshots.example/lumen-1_25667070.tar.lz4"}'
+fi
+exit 0
+STUB
+chmod +x "$edgenet_stub_dir/curl"
+
+# dasel and lz4 are not installed on a dev machine, and real tar would reject the fake
+# archive. lz4 writes nothing, so the tar stub sees EOF on the pipe immediately; neither
+# reads the caller's stdin.
+printf '#!/bin/sh\nexit 0\n' >"$edgenet_stub_dir/dasel"
+printf '#!/bin/sh\nexit 0\n' >"$edgenet_stub_dir/lz4"
+printf '#!/bin/sh\ncat >/dev/null\nexit 0\n' >"$edgenet_stub_dir/tar"
+chmod +x "$edgenet_stub_dir/dasel" "$edgenet_stub_dir/lz4" "$edgenet_stub_dir/tar"
+
+# desc -- runs edgenet.sh against a fresh fake HOME; sets EDGENET_RC/EDGENET_OUT/EDGENET_LOG.
+EDGENET_RC=0
+EDGENET_OUT=""
+EDGENET_HOME=""
+EDGENET_LOG=""
+run_edgenet() {
+  EDGENET_HOME=$(mktemp -d "$fake_home/run.XXXXXX")
+  EDGENET_LOG="$EDGENET_HOME/calls.log"
+  : >"$EDGENET_LOG"
+  echo '{}' >"$EDGENET_HOME/genesis.json"
+  mkdir -p "$EDGENET_HOME/.lumend"
+  "$@" # caller may seed CHAIN_HOME (e.g. drop the sentinel in) before the run
+  EDGENET_RC=0
+  EDGENET_OUT=$(env HOME="$EDGENET_HOME" EDGENET_LOG="$EDGENET_LOG" \
+    PATH="$edgenet_stub_dir:$PATH" \
+    BINARY=lumend CHAIN_ID=edgenet-1 DENOM=ualpha STAKE_DENOM=usync \
+    VALIDATOR_MONIKER=validator VALIDATOR_MNEMONIC='test test test' \
+    SNAPSHOT_URL=https://snapshots.example/meta.json \
+    bash "$SCRIPT_DIR/edgenet.sh" </dev/null 2>&1) || EDGENET_RC=$?
+}
+
+seed_sentinel() { : >"$EDGENET_HOME/.lumend/initialized"; }
+
+# 9a. Sentinel absent: the setup path runs, and the sentinel is on disk by the time
+#     in-place-testnet is invoked (it never returns, so there is no later chance).
+run_edgenet true
+log=$(cat "$EDGENET_LOG")
+assert_eq 0 "$EDGENET_RC" "first boot: setup path exits cleanly"
+if [[ "$log" == *"BINARY_INVOKED:in-place-testnet edgenet-1 euclid1validatoraddressstub"* ]]; then
+  pass "first boot: in-place-testnet is invoked with the chain id and validator address"
+else
+  fail "first boot: in-place-testnet is invoked (got: $log)"
+fi
+if [[ "$log" == *SENTINEL_PRESENT_AT_CONVERT* ]]; then
+  pass "first boot: sentinel exists by the time in-place-testnet is invoked"
+else
+  fail "first boot: sentinel exists by the time in-place-testnet is invoked (got: $log)"
+fi
+if [[ -f "$EDGENET_HOME/.lumend/initialized" ]]; then
+  pass "first boot: sentinel is left behind in CHAIN_HOME"
+else
+  fail "first boot: sentinel is left behind in CHAIN_HOME"
+fi
+if [[ "$log" == *BINARY_INVOKED:init* && "$log" == *CURL_INVOKED* ]]; then
+  pass "first boot: runs init and fetches the snapshot"
+else
+  fail "first boot: runs init and fetches the snapshot (got: $log)"
+fi
+if [[ "$EDGENET_OUT" == *"No existing chain"* ]]; then
+  pass "first boot: log announces the setup path"
+else
+  fail "first boot: log announces the setup path (got: $EDGENET_OUT)"
+fi
+
+# 9b. Sentinel present: `start` with the exact serving flags, and no in-place-testnet.
+run_edgenet seed_sentinel
+log=$(cat "$EDGENET_LOG")
+assert_eq 0 "$EDGENET_RC" "restart: exits cleanly"
+if [[ "$log" == *"BINARY_INVOKED:start --home $EDGENET_HOME/.lumend --rpc.laddr tcp://0.0.0.0:26657 --api.enable true --api.swagger true --api.enabled-unsafe-cors true"* ]]; then
+  pass "restart: start is invoked with the exact serving flags"
+else
+  fail "restart: start is invoked with the exact serving flags (got: $log)"
+fi
+if [[ "$log" != *in-place-testnet* ]]; then
+  pass "restart: in-place-testnet is NOT invoked"
+else
+  fail "restart: in-place-testnet is NOT invoked (it was: $log)"
+fi
+if [[ "$log" != *CURL_INVOKED* ]]; then
+  pass "restart: makes no curl call to the snapshot endpoint"
+else
+  fail "restart: makes no curl call to the snapshot endpoint (got: $log)"
+fi
+if [[ "$log" != *BINARY_INVOKED:init* && "$log" != *BINARY_INVOKED:keys* ]]; then
+  pass "restart: skips init and key add"
+else
+  fail "restart: skips init and key add (got: $log)"
+fi
+if [[ "$EDGENET_OUT" == *"Existing chain found"* ]]; then
+  pass "restart: log announces the restart path"
+else
+  fail "restart: log announces the restart path (got: $EDGENET_OUT)"
+fi
+
+# 9c. The sentinel does not buy a pass on the quote guards: they validate values the
+#     restart path uses too ($BINARY and $CHAIN_HOME both feed `start`).
+EDGENET_RC=0
+seeded=$(mktemp -d "$fake_home/run.XXXXXX")
+mkdir -p "$seeded/.lumend"
+: >"$seeded/.lumend/initialized"
+out=$(env HOME="$seeded" EDGENET_LOG=/dev/null PATH="$edgenet_stub_dir:$PATH" \
+  BINARY='"lumend"' CHAIN_ID=edgenet-1 DENOM=ualpha STAKE_DENOM=usync \
+  SNAPSHOT_URL=https://snapshots.example/meta.json \
+  bash "$SCRIPT_DIR/edgenet.sh" 2>&1) || EDGENET_RC=$?
+if (( EDGENET_RC != 0 )) && [[ "$out" == *"literal quote character"* ]]; then
+  pass "restart: quote guards still run on the sentinel path"
+else
+  fail "restart: quote guards still run on the sentinel path (rc=$EDGENET_RC, got: $out)"
+fi
+
 # --- summary --------------------------------------------------------------------
 
 echo

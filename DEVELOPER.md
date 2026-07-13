@@ -116,9 +116,37 @@ stated anywhere in the repository, and it is not this document's place to guess.
 ## 3. Boot sequence: `scripts/edgenet.sh`
 
 Runs as the entrypoint of the `edgenet` container. `set -e`, so any failing step
-aborts the boot. In order:
+aborts the boot. `CHAIN_HOME=$HOME/.$BINARY`, and the very first thing the
+script does is check whether `$CHAIN_HOME/initialized` exists. That check
+branches the boot into one of two paths, replacing the old behaviour where
+every boot unconditionally wiped and rebuilt the chain.
 
-1. **Clear the home directory's contents.** `CHAIN_HOME=$HOME/.$BINARY`. Since
+### Resume path: the sentinel exists
+
+The chain was already built in this `CHAIN_HOME` by a previous boot. The
+script skips every setup step below, clears nothing, fetches no snapshot
+metadata, downloads nothing, and execs directly into:
+
+```
+$BINARY start --home $CHAIN_HOME \
+    --rpc.laddr tcp://0.0.0.0:26657 \
+    --api.enable true \
+    --api.swagger true \
+    --api.enabled-unsafe-cors true
+```
+
+Because `docker-compose.yml` bind mounts `./.config/${CHAIN_ID}_edgenet/` onto
+`CHAIN_HOME`, the sentinel and the rest of the chain state outlive the
+container, so this is the path an ordinary restart, whether triggered by
+`docker compose restart`, a host reboot, or Compose's `restart: on-failure`,
+takes. `make clean` removes `.config`, and with it the sentinel, which is the
+only way to force the next boot back onto the build path below. Deleting just
+`$CHAIN_HOME/initialized` by hand has the same effect without discarding the
+rest of the chain home.
+
+### Build path: the sentinel is absent
+
+1. **Clear the home directory's contents.** Since
    `HOME` is `/${BINARY}` (set in `Dockerfile.edgenet`) and Compose bind mounts
    `./.config/${CHAIN_ID}_edgenet/` onto `/${BINARY}/.${BINARY}/`, `CHAIN_HOME`
    is a live mountpoint from inside the container. It cannot be unlinked from
@@ -130,7 +158,7 @@ aborts the boot. In order:
    `find "$CHAIN_HOME" -mindepth 1 -maxdepth 1 -exec rm -rf {} +`, which clears
    everything under the mountpoint without touching the mountpoint itself.
    `-mindepth 1` also picks up dotfiles and is a no-op on an already empty
-   directory. Every boot is still a clean boot from the chain's perspective.
+   directory. This step only runs on the build path now, not on every boot;
    `make clean` does the equivalent from the host by removing `.config`.
 2. **Init with the recovered mnemonic.**
    `echo $VALIDATOR_MNEMONIC | $BINARY init $VALIDATOR_MONIKER --chain-id
@@ -167,7 +195,15 @@ aborts the boot. In order:
 7. **Extract.** `lz4 -dc $SNAPSHOT_FILE | tar -C $CHAIN_HOME/ -xf -`. Streamed,
    so the tarball is never materialised on disk. This is why the image needs
    `lz4`.
-8. **Launch.**
+8. **Write the sentinel, then launch.** `touch "$CHAIN_HOME/initialized"` runs
+   immediately before `in-place-testnet`, not after, because there is no
+   "after": `in-place-testnet` never returns, it converts the restored state
+   and then runs the node itself. This is a deliberate, accepted tradeoff, not
+   an oversight, and it is listed as a known gap in section 7: a conversion
+   that dies partway through leaves the sentinel written over a
+   half-converted home, and the next boot takes the resume path above and
+   runs `start` against it. Recovery is `make clean` (or deleting the
+   sentinel by hand).
    ```
    $BINARY in-place-testnet $CHAIN_ID $VALIDATOR_ADDRESS \
        --home $CHAIN_HOME \
@@ -176,6 +212,13 @@ aborts the boot. In order:
    ```
    `in-place-testnet` takes the restored mainnet state and rewrites it into a
    single validator network owned by `VALIDATOR_ADDRESS`.
+
+### Consequence: `SNAPSHOT_URL` changes are ignored once initialized
+
+The resume path never reaches step 6 above, so editing `SNAPSHOT_URL` in
+`.env` has no effect on a `CHAIN_HOME` that already has a sentinel. The new
+value is only read the next time the script takes the build path, which means
+after `make clean` or after deleting `$CHAIN_HOME/initialized` by hand.
 
 ### Known limitation: hardcoded funding
 
@@ -413,6 +456,15 @@ None of these are blocking. All of them are real.
   ties `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` to the snapshot selected by
   `SNAPSHOT_URL`; see section 2. There is no validation, warning, or check of
   any kind if an operator changes one without the other.
+* **An unrelated crash can now loop instead of self-healing.** Persisting the
+  chain across restarts (section 3) means Compose's `restart: on-failure` on
+  the `edgenet` service restarts the container straight back into
+  `$BINARY start` against the same chain home. If the crash was caused by
+  something in that home, for example a corrupted database after a hard
+  kill, rather than by a bad snapshot or a bad config, the container can
+  crash-loop. Before this change, every restart rebuilt the chain from
+  scratch, which incidentally self-healed this class of failure. There is no
+  automatic detection of a broken home; the recovery is manual, `make clean`.
 
 ## 8. Troubleshooting
 

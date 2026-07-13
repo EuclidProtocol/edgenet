@@ -61,9 +61,9 @@ The node container also declares P2P port 26656, but compose does not publish it
 | Path | Contents | Cleared by |
 | --- | --- | --- |
 | `cache/` | `snapshot-<height>.tar.lz4`, one downloaded snapshot archive per distinct height | nothing, delete it by hand to force a re-download |
-| `.config/${CHAIN_ID}_edgenet/` | the node's chain home (keys, config, state) | `make clean` |
+| `.config/${CHAIN_ID}_edgenet/` | the node's chain home (keys, config, state, plus an `initialized` sentinel once the chain has been built) | `make clean` |
 
-Both are git ignored. Because the cache file is now named after the snapshot height, `cache/` grows by one archive every time you point `SNAPSHOT_URL` at a different height, and it is never pruned automatically. If you upgraded from an older checkout, `cache/` may still hold a leftover `snapshot.tar.lz4` from the previous single file naming scheme; it is orphaned and safe to delete by hand.
+Both are git ignored. The `initialized` sentinel is what makes the chain persist across restarts instead of being rebuilt from the snapshot every time; removing it, whether via `make clean` or by hand, is what forces a rebuild. See [How the Lumen node boots](#how-the-lumen-node-boots). Because the cache file is now named after the snapshot height, `cache/` grows by one archive every time you point `SNAPSHOT_URL` at a different height, and it is never pruned automatically. If you upgraded from an older checkout, `cache/` may still hold a leftover `snapshot.tar.lz4` from the previous single file naming scheme; it is orphaned and safe to delete by hand.
 
 ## Make targets
 
@@ -196,18 +196,26 @@ The next `make edgenet` picks the service up automatically, because everything i
 
 ## How the Lumen node boots
 
-`scripts/edgenet.sh` is the container entrypoint. On every start it:
+`scripts/edgenet.sh` is the container entrypoint. It checks for a sentinel file, `$CHAIN_HOME/initialized`, before doing anything else, and that check decides which of two paths the boot takes.
+
+**If the sentinel is present, the chain resumes.** The script skips setup entirely, clearing nothing, downloading nothing, and execs straight into `$BINARY start` against the existing chain home, with the RPC and API flags. This is the path an ordinary restart takes.
+
+**If the sentinel is absent, the chain is built from the snapshot:**
 
 1. Clears the contents of the chain home directory (not the directory itself, since it is a live bind mount, see the note below), then initialises a fresh one and recovers the validator key from `VALIDATOR_MNEMONIC`.
 2. Copies in the genesis file that was baked into the image at build time.
 3. Sets the keyring backend to `test` and the chain id in `client.toml`.
 4. Fetches the snapshot metadata JSON from `SNAPSHOT_URL`, reads `.url` (the archive location) and `.height` from it, then downloads the archive from `.url` into `cache/snapshot-<height>.tar.lz4`, but only if that file is not already there.
 5. Decompresses it with `lz4` and unpacks it into the chain home.
-6. Starts the chain with `in-place-testnet`, which rewrites the snapshot state so the recovered validator is the sole validator, and funds a preset development account with a large balance of `DENOM` and `STAKE_DENOM`.
+6. Writes the sentinel file, then starts the chain with `in-place-testnet`, which rewrites the snapshot state so the recovered validator is the sole validator, and funds a preset development account with a large balance of `DENOM` and `STAKE_DENOM`. The sentinel is written before `in-place-testnet` runs, not after, because that command never returns: it converts the state and then runs the node itself.
 
-The chain home is rebuilt from the snapshot on every start, so the node is disposable. Delete the matching `cache/snapshot-<height>.tar.lz4` to force a fresh snapshot download next time.
+Because `CHAIN_HOME` is a bind mount (`./.config/${CHAIN_ID}_edgenet/`), the sentinel and the rest of the chain data survive container restarts, which is what makes the node's state persistent instead of being rebuilt from the snapshot every time it starts. Three things follow from this, and each has a Troubleshooting entry below:
 
-`docker-compose.yml` bind mounts `./.config/${CHAIN_ID}_edgenet/` onto the chain home inside the container, so step 1 cannot simply `rm -rf` that path (a live mountpoint cannot be unlinked from inside the container that holds it). The script instead removes everything under the directory while leaving the directory itself in place.
+* **Changing `SNAPSHOT_URL` has no effect on an already-initialized container.** The resume path never reaches the snapshot code. To move to a different snapshot, run `make clean` (or delete `$CHAIN_HOME/initialized` by hand) first, then start the stack again so it rebuilds.
+* **A conversion that dies partway leaves the sentinel over a half-converted home.** The sentinel is written just before `in-place-testnet`, which is the only point available since that command never returns. If it dies partway through, the next restart takes the resume path and runs `start` against a home that was never fully converted. Recovery is `make clean`.
+* **A crash from an unrelated cause can now loop instead of self-healing.** `docker-compose.yml` sets `restart: on-failure` on the `edgenet` service. Previously every restart wiped and rebuilt the chain, so a corrupted database after a hard kill, for example, silently fixed itself. Now the container restarts straight back into `start` against the same broken home and can crash-loop. `make clean` is the recovery path.
+
+`docker-compose.yml` bind mounts `./.config/${CHAIN_ID}_edgenet/` onto the chain home inside the container, so step 1 of the build path cannot simply `rm -rf` that path (a live mountpoint cannot be unlinked from inside the container that holds it). The script instead removes everything under the directory while leaving the directory itself in place.
 
 ## How each anvil fork boots
 
@@ -251,3 +259,9 @@ See [DEVELOPER.md](DEVELOPER.md#8-troubleshooting), this is a different failure 
 
 **The stack starts from stale chain data.**
 Run `make clean` to drop `.config/`, and delete the relevant `cache/snapshot-<height>.tar.lz4` if you also want a fresh snapshot download. `make clean` alone keeps the cached archive.
+
+**I changed `SNAPSHOT_URL` but the node is still running the old snapshot.**
+Once `.config/${CHAIN_ID}_edgenet/initialized` exists, the node resumes its existing chain on every restart instead of rebuilding it, and the resume path never reaches the snapshot code, so a new `SNAPSHOT_URL` is not picked up. Run `make clean` (or delete that `initialized` file by hand) and start the stack again so it rebuilds from the new snapshot.
+
+**The node is crash-looping.**
+The chain now persists across restarts, and `docker-compose.yml` sets `restart: on-failure` on the `edgenet` service, so a crash caused by something in the chain home itself (a corrupted database after a hard kill, for example, rather than a bad snapshot or config) restarts straight back into the same broken home and can loop. Run `make clean` to drop `.config/` and force a rebuild.
