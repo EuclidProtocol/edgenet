@@ -11,7 +11,10 @@ STAKE_DENOM="${STAKE_DENOM:-usync}"
 # Bash never strips quotes from an expansion result, so a value like "lumend"
 # (quotes included) would build CHAIN_HOME as /"lumend"/."lumend" and hand curl
 # an unusable URL. Fail before anything is deleted, downloaded, or created.
-for var in BINARY CHAIN_ID DENOM STAKE_DENOM SNAPSHOT_URL; do
+# The check is only about quote characters, so an empty value passes it: that
+# matters for FUNDED_ACCOUNTS, which is legitimately empty when no extra
+# development accounts are configured.
+for var in BINARY CHAIN_ID DENOM STAKE_DENOM SNAPSHOT_URL FUNDED_ACCOUNTS; do
     value="${!var:-}"
     case "$value" in
         *\"*|*\'*)
@@ -86,7 +89,11 @@ edit_client
 echo "🔑 Adding validator account"
 echo $VALIDATOR_MNEMONIC | $BINARY keys add $VALIDATOR_MONIKER --keyring-backend test --home $CHAIN_HOME --recover
 
-VALIDATOR_ADDRESS=$($BINARY keys show -a $VALIDATOR_MONIKER --keyring-backend test --home $CHAIN_HOME)
+# The account address (euclid1...) and the operator address (euclidvaloper1...) are
+# the same key in two bech32 prefixes. in-place-testnet wants the operator form for
+# --validator-operator and the account form for --accounts-to-fund/--cosmwasm-admin.
+VAL_ACCOUNT=$($BINARY keys show -a $VALIDATOR_MONIKER --keyring-backend test --home $CHAIN_HOME)
+VAL_OPERATOR=$($BINARY keys show $VALIDATOR_MONIKER --bech val -a --keyring-backend test --home $CHAIN_HOME)
 
 # SNAPSHOT_URL is a metadata endpoint, not the archive itself. It answers with
 # JSON of the form {"height":25667070,"url":"https://.../lumen-1_25667070.tar.lz4",...}
@@ -149,6 +156,48 @@ echo "♻️  Restoring snapshot at height $SNAPSHOT_HEIGHT"
 
 lz4 -dc $SNAPSHOT_FILE | tar -C $CHAIN_HOME/ -xf -
 
+# The consensus key is read HERE, after the snapshot has been extracted, and not
+# right after `init`. Order matters: the snapshot tarball can carry its own config/
+# and overwrite the priv_validator_key.json that `init` generated. Reading it earlier
+# would hand in-place-testnet a consensus key that no longer matches the one on disk,
+# and the converted chain would refuse to sign blocks.
+PRIV_VALIDATOR_KEY=$CONFIG_FOLDER/priv_validator_key.json
+
+echo "🔐 Reading the consensus key from $PRIV_VALIDATOR_KEY"
+if [ ! -f "$PRIV_VALIDATOR_KEY" ]; then
+    echo "FATAL: $PRIV_VALIDATOR_KEY does not exist after restoring the snapshot." >&2
+    echo "       in-place-testnet needs the consensus key of this node; refusing to continue." >&2
+    exit 1
+fi
+
+# Nothing below ever prints the file or the private key: this is the node's consensus
+# signing key. jq's output is redirected, and the error paths quote only the path.
+if ! jq -e . "$PRIV_VALIDATOR_KEY" >/dev/null 2>&1; then
+    echo "FATAL: $PRIV_VALIDATOR_KEY is not valid JSON." >&2
+    echo "       Its contents are secret, so they are not shown here." >&2
+    exit 1
+fi
+
+CONSENSUS_PUBKEY=$(jq -r '.pub_key.value // empty' "$PRIV_VALIDATOR_KEY")
+CONSENSUS_PRIVKEY=$(jq -r '.priv_key.value // empty' "$PRIV_VALIDATOR_KEY")
+
+if [ -z "$CONSENSUS_PUBKEY" ]; then
+    echo "FATAL: $PRIV_VALIDATOR_KEY has no .pub_key.value" >&2
+    exit 1
+fi
+
+if [ -z "$CONSENSUS_PRIVKEY" ]; then
+    echo "FATAL: $PRIV_VALIDATOR_KEY has no .priv_key.value" >&2
+    exit 1
+fi
+
+# The validator account is always funded; FUNDED_ACCOUNTS (comma separated, may be
+# empty) adds the development accounts on top. Empty must not produce a trailing
+# comma, which in-place-testnet would read as an empty address and reject.
+ACCOUNTS_TO_FUND=$VAL_ACCOUNT
+if [ -n "${FUNDED_ACCOUNTS:-}" ]; then
+    ACCOUNTS_TO_FUND=$ACCOUNTS_TO_FUND,$FUNDED_ACCOUNTS
+fi
 
 # Written before in-place-testnet because in-place-testnet never returns (it converts
 # the restored state and then runs the node), so there is no "after" to write it in.
@@ -158,7 +207,13 @@ lz4 -dc $SNAPSHOT_FILE | tar -C $CHAIN_HOME/ -xf -
 touch "$CHAIN_HOME/initialized"
 
 echo "🏁 Starting $CHAIN_ID..."
-$BINARY in-place-testnet $CHAIN_ID $VALIDATOR_ADDRESS \
+echo "👤 Validator operator: $VAL_OPERATOR"
+echo "💰 Funding accounts: $ACCOUNTS_TO_FUND"
+$BINARY in-place-testnet $CHAIN_ID \
+    --validator-operator=$VAL_OPERATOR \
+    --validator-pubkey=$CONSENSUS_PUBKEY \
+    --validator-privkey=$CONSENSUS_PRIVKEY \
+    --accounts-to-fund=$ACCOUNTS_TO_FUND \
+    --cosmwasm-admin=$VAL_ACCOUNT \
     --home $CHAIN_HOME \
-    --accounts-to-fund euclid1z328t58xya5hw32a869n6hah33uaehw5zz9rj3 \
-    --coins-to-fund 1000000000000$STAKE_DENOM,1000000000000$DENOM
+    --coins-to-fund 1000000000000$DENOM,1000000000000$STAKE_DENOM

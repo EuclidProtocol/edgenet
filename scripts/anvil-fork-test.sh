@@ -232,8 +232,11 @@ edgenet_stub_dir=$(mktemp -d)
 trap 'rm -rf "$stub_dir" "$fake_home" "$edgenet_stub_dir"' EXIT
 
 # The chain binary logs its argv to $EDGENET_LOG. `init` creates the config dir the
-# real one would; `keys show` prints an address; `in-place-testnet` additionally
-# records whether the sentinel already existed when it was invoked.
+# real one would, along with the priv_validator_key.json it would generate (the INIT_*
+# values below stand for the key a fresh `init` mints, which the snapshot may later
+# overwrite). `keys show` prints an address, in the operator bech32 prefix when asked
+# with --bech val. `in-place-testnet` additionally records whether the sentinel already
+# existed when it was invoked.
 cat >"$edgenet_stub_dir/lumend" <<'STUB'
 #!/bin/sh
 echo "BINARY_INVOKED:$*" >>"$EDGENET_LOG"
@@ -241,12 +244,19 @@ case "$1" in
   init)
     cat >/dev/null
     mkdir -p "$HOME/.lumend/config"
+    printf '%s' '{"address":"INITADDR","pub_key":{"type":"tendermint/PubKeyEd25519","value":"INIT_PUBKEY_FROM_INIT"},"priv_key":{"type":"tendermint/PrivKeyEd25519","value":"INIT_PRIVKEY_FROM_INIT"}}' \
+      >"$HOME/.lumend/config/priv_validator_key.json"
     ;;
   keys)
     # Only `keys add` is fed a mnemonic on stdin; `keys show` must not read at all
     # (it runs in a command substitution and would block on the caller's stdin).
     [ "$2" = "add" ] && cat >/dev/null
-    [ "$2" = "show" ] && echo euclid1validatoraddressstub
+    if [ "$2" = "show" ]; then
+      case " $* " in
+        *" --bech val "*) echo euclidvaloper1validatoroperatorstub ;;
+        *)                echo euclid1validatoraddressstub ;;
+      esac
+    fi
     ;;
   in-place-testnet)
     if [ -f "$HOME/.lumend/initialized" ]; then
@@ -287,14 +297,46 @@ chmod +x "$edgenet_stub_dir/curl"
 # reads the caller's stdin.
 printf '#!/bin/sh\nexit 0\n' >"$edgenet_stub_dir/dasel"
 printf '#!/bin/sh\nexit 0\n' >"$edgenet_stub_dir/lz4"
-printf '#!/bin/sh\ncat >/dev/null\nexit 0\n' >"$edgenet_stub_dir/tar"
+
+# A real mainnet snapshot tarball can carry its own config/, so extracting it clobbers
+# the priv_validator_key.json that `init` just generated. That is exactly why edgenet.sh
+# must read the consensus key AFTER extraction. This stub reproduces it: SNAPSHOT_KEY
+# is what the "archive" drops at config/priv_validator_key.json on top of init's file.
+#   unset      -> archive carries no config/, init's key survives
+#   __DELETE__ -> archive's config/ has no key file at all (deletes it)
+#   __EMPTY__  -> archive carries a truncated/empty key file
+#   anything   -> that literal JSON is written
+cat >"$edgenet_stub_dir/tar" <<'STUB'
+#!/bin/sh
+cat >/dev/null
+dir=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -C) dir=$2; shift ;;
+  esac
+  shift
+done
+echo "TAR_INVOKED:extracted-to:$dir" >>"$EDGENET_LOG"
+key=$dir/config/priv_validator_key.json
+case "${SNAPSHOT_KEY:-}" in
+  "")         ;;
+  __DELETE__) rm -f "$key" ;;
+  __EMPTY__)  mkdir -p "$dir/config"; : >"$key" ;;
+  *)          mkdir -p "$dir/config"; printf '%s' "$SNAPSHOT_KEY" >"$key" ;;
+esac
+exit 0
+STUB
 chmod +x "$edgenet_stub_dir/dasel" "$edgenet_stub_dir/lz4" "$edgenet_stub_dir/tar"
 
-# desc -- runs edgenet.sh against a fresh fake HOME; sets EDGENET_RC/EDGENET_OUT/EDGENET_LOG.
+# run_edgenet <seed-cmd...> -- runs edgenet.sh against a fresh fake HOME; sets
+# EDGENET_RC/EDGENET_OUT/EDGENET_LOG. Callers add per-run environment (FUNDED_ACCOUNTS,
+# SNAPSHOT_KEY) by filling EDGENET_ENV before the call; it is reset after every run so
+# one test's environment cannot leak into the next.
 EDGENET_RC=0
 EDGENET_OUT=""
 EDGENET_HOME=""
 EDGENET_LOG=""
+EDGENET_ENV=()
 run_edgenet() {
   EDGENET_HOME=$(mktemp -d "$fake_home/run.XXXXXX")
   EDGENET_LOG="$EDGENET_HOME/calls.log"
@@ -303,12 +345,16 @@ run_edgenet() {
   mkdir -p "$EDGENET_HOME/.lumend"
   "$@" # caller may seed CHAIN_HOME (e.g. drop the sentinel in) before the run
   EDGENET_RC=0
+  # ${arr[@]+"${arr[@]}"} because bash 3.2 (the macOS system bash this suite runs under)
+  # treats an empty array as unset under `set -u`.
   EDGENET_OUT=$(env HOME="$EDGENET_HOME" EDGENET_LOG="$EDGENET_LOG" \
     PATH="$edgenet_stub_dir:$PATH" \
     BINARY=lumend CHAIN_ID=edgenet-1 DENOM=ualpha STAKE_DENOM=usync \
     VALIDATOR_MONIKER=validator VALIDATOR_MNEMONIC='test test test' \
     SNAPSHOT_URL=https://snapshots.example/meta.json \
+    ${EDGENET_ENV[@]+"${EDGENET_ENV[@]}"} \
     bash "$SCRIPT_DIR/edgenet.sh" </dev/null 2>&1) || EDGENET_RC=$?
+  EDGENET_ENV=()
 }
 
 seed_sentinel() { : >"$EDGENET_HOME/.lumend/initialized"; }
@@ -318,8 +364,8 @@ seed_sentinel() { : >"$EDGENET_HOME/.lumend/initialized"; }
 run_edgenet true
 log=$(cat "$EDGENET_LOG")
 assert_eq 0 "$EDGENET_RC" "first boot: setup path exits cleanly"
-if [[ "$log" == *"BINARY_INVOKED:in-place-testnet edgenet-1 euclid1validatoraddressstub"* ]]; then
-  pass "first boot: in-place-testnet is invoked with the chain id and validator address"
+if [[ "$log" == *"BINARY_INVOKED:in-place-testnet edgenet-1 --validator-operator=euclidvaloper1validatoroperatorstub"* ]]; then
+  pass "first boot: in-place-testnet is invoked with the chain id and the validator operator"
 else
   fail "first boot: in-place-testnet is invoked (got: $log)"
 fi
@@ -389,6 +435,164 @@ if (( EDGENET_RC != 0 )) && [[ "$out" == *"literal quote character"* ]]; then
 else
   fail "restart: quote guards still run on the sentinel path (rc=$EDGENET_RC, got: $out)"
 fi
+
+# 10. in-place-testnet arguments. Everything it is handed is derived from the node's
+#     own keys at runtime: the operator address from the keyring, the consensus key pair
+#     from config/priv_validator_key.json.
+SNAP_PUB='SNAPSHOT_PUBKEY_Zm9vYmFy'
+SNAP_PRIV='SNAPSHOT_PRIVKEY_c2VjcmV0'
+SNAP_KEY_JSON="{\"address\":\"SNAPADDR\",\"pub_key\":{\"type\":\"tendermint/PubKeyEd25519\",\"value\":\"$SNAP_PUB\"},\"priv_key\":{\"type\":\"tendermint/PrivKeyEd25519\",\"value\":\"$SNAP_PRIV\"}}"
+
+# 10a. The full command line, with FUNDED_ACCOUNTS unset.
+EDGENET_ENV=("SNAPSHOT_KEY=$SNAP_KEY_JSON")
+run_edgenet true
+log=$(cat "$EDGENET_LOG")
+assert_eq 0 "$EDGENET_RC" "in-place-testnet: setup path exits cleanly"
+
+expected_cmd="BINARY_INVOKED:in-place-testnet edgenet-1 \
+--validator-operator=euclidvaloper1validatoroperatorstub \
+--validator-pubkey=$SNAP_PUB \
+--validator-privkey=$SNAP_PRIV \
+--accounts-to-fund=euclid1validatoraddressstub \
+--cosmwasm-admin=euclid1validatoraddressstub \
+--home $EDGENET_HOME/.lumend \
+--coins-to-fund 1000000000000ualpha,1000000000000usync"
+if [[ "$log" == *"$expected_cmd"* ]]; then
+  pass "in-place-testnet: exact command line (operator, pubkey, privkey, accounts, admin, coins)"
+else
+  fail "in-place-testnet: exact command line
+  expected: $expected_cmd
+  got:      $log"
+fi
+
+# The consensus key is the node's block-signing key. It is passed on the command line
+# because in-place-testnet takes it there, but edgenet.sh must never print it.
+if [[ "$EDGENET_OUT" != *"$SNAP_PRIV"* ]]; then
+  pass "in-place-testnet: the private key never appears on stdout/stderr"
+else
+  fail "in-place-testnet: the private key never appears on stdout/stderr (it was printed: $EDGENET_OUT)"
+fi
+if [[ "$EDGENET_OUT" != *"priv_key"* ]]; then
+  pass "in-place-testnet: the key file's contents are never dumped"
+else
+  fail "in-place-testnet: the key file's contents are never dumped (got: $EDGENET_OUT)"
+fi
+
+# ORDERING. The tar stub overwrote priv_validator_key.json with the snapshot's own copy,
+# exactly as a real snapshot carrying config/ does. Reading the key after `init` instead
+# of after extraction would hand in-place-testnet the (now stale) INIT_* key, so seeing
+# the snapshot's key here is the proof that the read happens post-extraction.
+if [[ "$log" == *"$SNAP_PUB"* && "$log" != *INIT_PUBKEY_FROM_INIT* && "$log" != *INIT_PRIVKEY_FROM_INIT* ]]; then
+  pass "in-place-testnet: consensus key is read AFTER snapshot extraction, not after init"
+else
+  fail "in-place-testnet: consensus key is read AFTER snapshot extraction, not after init (got: $log)"
+fi
+if [[ "$log" == *TAR_INVOKED* ]]; then
+  pass "in-place-testnet: the snapshot really was extracted in this run"
+else
+  fail "in-place-testnet: the snapshot really was extracted in this run (got: $log)"
+fi
+
+# 10b. FUNDED_ACCOUNTS unset: only the validator account, and no trailing comma (which
+#      in-place-testnet would parse as an empty address).
+if [[ "$log" == *"--accounts-to-fund=euclid1validatoraddressstub --cosmwasm-admin"* ]]; then
+  pass "FUNDED_ACCOUNTS unset: accounts-to-fund is just the validator, no trailing comma"
+else
+  fail "FUNDED_ACCOUNTS unset: accounts-to-fund is just the validator, no trailing comma (got: $log)"
+fi
+
+# 10c. FUNDED_ACCOUNTS empty (compose passes an empty string for an undefined .env var,
+#      so empty must behave exactly like unset).
+EDGENET_ENV=("SNAPSHOT_KEY=$SNAP_KEY_JSON" "FUNDED_ACCOUNTS=")
+run_edgenet true
+log=$(cat "$EDGENET_LOG")
+assert_eq 0 "$EDGENET_RC" "FUNDED_ACCOUNTS empty: setup path exits cleanly"
+if [[ "$log" == *"--accounts-to-fund=euclid1validatoraddressstub --cosmwasm-admin"* ]]; then
+  pass "FUNDED_ACCOUNTS empty: accounts-to-fund is just the validator, no trailing comma"
+else
+  fail "FUNDED_ACCOUNTS empty: accounts-to-fund is just the validator, no trailing comma (got: $log)"
+fi
+# FUNDED_ACCOUNTS is in the quote-guard loop, but unlike every other var in that loop it
+# is legitimately empty. The guard only looks for quote characters, so empty must sail
+# through it rather than being read as "unset, therefore broken".
+if [[ "$EDGENET_OUT" != *"literal quote character"* ]]; then
+  pass "FUNDED_ACCOUNTS empty: passes the quote guard and boots"
+else
+  fail "FUNDED_ACCOUNTS empty: passes the quote guard and boots (guard rejected it: $EDGENET_OUT)"
+fi
+
+# 10d. FUNDED_ACCOUNTS set: appended to the validator account, comma joined.
+EDGENET_ENV=("SNAPSHOT_KEY=$SNAP_KEY_JSON" "FUNDED_ACCOUNTS=euclid1aaaaaaaaaa,euclid1bbbbbbbbbb")
+run_edgenet true
+log=$(cat "$EDGENET_LOG")
+assert_eq 0 "$EDGENET_RC" "FUNDED_ACCOUNTS set: setup path exits cleanly"
+if [[ "$log" == *"--accounts-to-fund=euclid1validatoraddressstub,euclid1aaaaaaaaaa,euclid1bbbbbbbbbb --cosmwasm-admin"* ]]; then
+  pass "FUNDED_ACCOUNTS set: validator account plus the configured accounts, comma joined"
+else
+  fail "FUNDED_ACCOUNTS set: validator account plus the configured accounts, comma joined (got: $log)"
+fi
+if [[ "$log" == *"--cosmwasm-admin=euclid1validatoraddressstub"* ]]; then
+  pass "FUNDED_ACCOUNTS set: cosmwasm-admin stays the validator account"
+else
+  fail "FUNDED_ACCOUNTS set: cosmwasm-admin stays the validator account (got: $log)"
+fi
+
+# 10e. A quoted FUNDED_ACCOUNTS is the same bug class the quote guard exists for: bash
+#      never strips the quotes, so `--accounts-to-fund="euclid1..."` would reach the
+#      chain as a literal-quoted bech32 address. The guard runs first, so this dies
+#      before any teardown, let alone before in-place-testnet.
+EDGENET_ENV=("SNAPSHOT_KEY=$SNAP_KEY_JSON" 'FUNDED_ACCOUNTS="euclid1aaaaaaaaaa"')
+run_edgenet true
+log=$(cat "$EDGENET_LOG")
+if (( EDGENET_RC != 0 )) && [[ "$EDGENET_OUT" == *"literal quote character"* && "$EDGENET_OUT" == *FUNDED_ACCOUNTS* ]]; then
+  pass "quoted FUNDED_ACCOUNTS: rejected by the quote guard, which names the variable"
+else
+  fail "quoted FUNDED_ACCOUNTS: rejected by the quote guard, which names the variable (rc=$EDGENET_RC, got: $EDGENET_OUT)"
+fi
+if [[ "$EDGENET_OUT" == *"remove the surrounding quotes"* ]]; then
+  pass "quoted FUNDED_ACCOUNTS: error keeps the loop's .env wording"
+else
+  fail "quoted FUNDED_ACCOUNTS: error keeps the loop's .env wording (got: $EDGENET_OUT)"
+fi
+if [[ "$log" != *in-place-testnet* ]]; then
+  pass "quoted FUNDED_ACCOUNTS: dies before in-place-testnet runs"
+else
+  fail "quoted FUNDED_ACCOUNTS: dies before in-place-testnet runs (it ran: $log)"
+fi
+
+# Single quotes too, since a .env parse that preserves them is the same defect.
+EDGENET_ENV=("SNAPSHOT_KEY=$SNAP_KEY_JSON" "FUNDED_ACCOUNTS='euclid1aaaaaaaaaa'")
+run_edgenet true
+log=$(cat "$EDGENET_LOG")
+if (( EDGENET_RC != 0 )) && [[ "$EDGENET_OUT" == *"literal quote character"* && "$log" != *in-place-testnet* ]]; then
+  pass "single-quoted FUNDED_ACCOUNTS: fatal before in-place-testnet runs"
+else
+  fail "single-quoted FUNDED_ACCOUNTS: fatal before in-place-testnet runs (rc=$EDGENET_RC, got: $EDGENET_OUT)"
+fi
+
+# 10f. An unusable priv_validator_key.json is fatal, and fatal BEFORE in-place-testnet:
+#      handing it an empty --validator-privkey would produce a chain that cannot sign.
+#      One case per way the file can be unusable after extraction.
+EMPTY_FIELDS_JSON='{"address":"X","pub_key":{"type":"tendermint/PubKeyEd25519","value":""},"priv_key":{"type":"tendermint/PrivKeyEd25519","value":""}}'
+NO_PRIV_JSON="{\"pub_key\":{\"type\":\"tendermint/PubKeyEd25519\",\"value\":\"$SNAP_PUB\"}}"
+
+for bad_case in "__DELETE__:missing file" "__EMPTY__:empty file" "$EMPTY_FIELDS_JSON:empty key fields" "$NO_PRIV_JSON:no priv_key"; do
+  bad_key=${bad_case%:*}
+  bad_desc=${bad_case##*:}
+  EDGENET_ENV=("SNAPSHOT_KEY=$bad_key")
+  run_edgenet true
+  log=$(cat "$EDGENET_LOG")
+  if (( EDGENET_RC != 0 )) && [[ "$EDGENET_OUT" == *priv_validator_key.json* ]]; then
+    pass "bad consensus key ($bad_desc): fatal, and the error names the key file"
+  else
+    fail "bad consensus key ($bad_desc): fatal, and the error names the key file (rc=$EDGENET_RC, got: $EDGENET_OUT)"
+  fi
+  if [[ "$log" != *in-place-testnet* ]]; then
+    pass "bad consensus key ($bad_desc): dies before in-place-testnet runs"
+  else
+    fail "bad consensus key ($bad_desc): dies before in-place-testnet runs (it ran: $log)"
+  fi
+done
 
 # --- summary --------------------------------------------------------------------
 

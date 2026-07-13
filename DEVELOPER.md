@@ -170,9 +170,14 @@ rest of the chain home.
 4. **Edit `client.toml` with `dasel`.** Two `dasel put` calls set
    `.keyring-backend` to `test` and `.chain-id` to `$CHAIN_ID`. This is why the
    image needs `dasel`.
-5. **Add the validator key.** `$BINARY keys add $VALIDATOR_MONIKER
-   --keyring-backend test --recover` from the same mnemonic, then read the
-   address back with `keys show -a` into `VALIDATOR_ADDRESS`.
+5. **Add the validator key, then derive both address forms.** `$BINARY keys
+   add $VALIDATOR_MONIKER --keyring-backend test --recover` from the same
+   mnemonic, then read it back twice: `keys show -a` into `VAL_ACCOUNT` (the
+   `euclid1...` account address) and `keys show --bech val -a` into
+   `VAL_OPERATOR` (the `euclidvaloper1...` operator address). Both are the
+   same key in two bech32 prefixes; `in-place-testnet` wants the operator
+   form for `--validator-operator` and the account form for
+   `--accounts-to-fund` / `--cosmwasm-admin`.
 6. **Resolve snapshot metadata, then download the snapshot, but only if
    absent.** `SNAPSHOT_URL` is a metadata endpoint, not the archive. The script
    `curl`s it, requires the body to be non empty and valid JSON, then reads
@@ -195,23 +200,58 @@ rest of the chain home.
 7. **Extract.** `lz4 -dc $SNAPSHOT_FILE | tar -C $CHAIN_HOME/ -xf -`. Streamed,
    so the tarball is never materialised on disk. This is why the image needs
    `lz4`.
-8. **Write the sentinel, then launch.** `touch "$CHAIN_HOME/initialized"` runs
-   immediately before `in-place-testnet`, not after, because there is no
-   "after": `in-place-testnet` never returns, it converts the restored state
-   and then runs the node itself. This is a deliberate, accepted tradeoff, not
-   an oversight, and it is listed as a known gap in section 7: a conversion
-   that dies partway through leaves the sentinel written over a
-   half-converted home, and the next boot takes the resume path above and
-   runs `start` against it. Recovery is `make clean` (or deleting the
-   sentinel by hand).
-   ```
-   $BINARY in-place-testnet $CHAIN_ID $VALIDATOR_ADDRESS \
-       --home $CHAIN_HOME \
-       --accounts-to-fund euclid1z328t58xya5hw32a869n6hah33uaehw5zz9rj3 \
-       --coins-to-fund 1000000000000$STAKE_DENOM,1000000000000$DENOM
-   ```
-   `in-place-testnet` takes the restored mainnet state and rewrites it into a
-   single validator network owned by `VALIDATOR_ADDRESS`.
+8. **Read the consensus key, only now, after extraction.** This ordering is a
+   constraint, not a detail: it must happen after step 7, never right after
+   `init` in step 2. The snapshot tarball can carry its own `config/` and
+   overwrite the `priv_validator_key.json` that `init` generated in step 2,
+   so reading the key any earlier would hand `in-place-testnet` a consensus
+   key that no longer matches what ends up on disk, and the converted chain
+   would refuse to sign blocks. The script reads
+   `$CHAIN_HOME/config/priv_validator_key.json` with `jq` into
+   `CONSENSUS_PUBKEY` (`.pub_key.value`) and `CONSENSUS_PRIVKEY`
+   (`.priv_key.value`), and dies before reaching `in-place-testnet` in any of
+   three cases: the file does not exist, the file is not valid JSON, or
+   either field is empty. None of the error paths print the file's contents;
+   it holds the node's consensus signing key.
+9. **Assemble the accounts to fund.** `ACCOUNTS_TO_FUND` starts as
+   `VAL_ACCOUNT`, the validator's own account, which is always funded. If
+   `FUNDED_ACCOUNTS` (a comma separated list of extra bech32 addresses, from
+   `.env`) is non empty, it is appended with a comma. Left empty,
+   `FUNDED_ACCOUNTS` funds only the validator; the script is careful not to
+   emit a trailing comma in that case, which `in-place-testnet` would read as
+   an empty address and reject.
+10. **Write the sentinel, then launch.** `touch "$CHAIN_HOME/initialized"` runs
+    immediately before `in-place-testnet`, not after, because there is no
+    "after": `in-place-testnet` never returns, it converts the restored state
+    and then runs the node itself. This is a deliberate, accepted tradeoff, not
+    an oversight, and it is listed as a known gap in section 7: a conversion
+    that dies partway through leaves the sentinel written over a
+    half-converted home, and the next boot takes the resume path above and
+    runs `start` against it. Recovery is `make clean` (or deleting the
+    sentinel by hand).
+    ```
+    $BINARY in-place-testnet $CHAIN_ID \
+        --validator-operator=$VAL_OPERATOR \
+        --validator-pubkey=$CONSENSUS_PUBKEY \
+        --validator-privkey=$CONSENSUS_PRIVKEY \
+        --accounts-to-fund=$ACCOUNTS_TO_FUND \
+        --cosmwasm-admin=$VAL_ACCOUNT \
+        --home $CHAIN_HOME \
+        --coins-to-fund 1000000000000$DENOM,1000000000000$STAKE_DENOM
+    ```
+    `in-place-testnet` takes the restored mainnet state and rewrites it into a
+    single validator network, owned by `VAL_OPERATOR`/`VAL_ACCOUNT`, with
+    `ACCOUNTS_TO_FUND` funded. This is the flag form `EuclidProtocol/vsld`
+    uses to drive the same subcommand; the older positional
+    `in-place-testnet $CHAIN_ID $VALIDATOR_ADDRESS` form is gone.
+
+    **Security note.** `--validator-privkey` places the consensus private
+    key on the command line, which makes it visible to anything that can run
+    `ps` inside the container. That is inherent to the `in-place-testnet`
+    interface, not something this script can avoid while using it; the
+    script itself never logs or echoes the key. This is a local testnet
+    validator key with no mainnet value, which is what makes that acceptable
+    here.
 
 ### Consequence: `SNAPSHOT_URL` changes are ignored once initialized
 
@@ -220,15 +260,17 @@ The resume path never reaches step 6 above, so editing `SNAPSHOT_URL` in
 value is only read the next time the script takes the build path, which means
 after `make clean` or after deleting `$CHAIN_HOME/initialized` by hand.
 
-### Known limitation: hardcoded funding
+### Known limitation: hardcoded fund amounts
 
-The funded account `euclid1z328t58xya5hw32a869n6hah33uaehw5zz9rj3` and the fund
-amounts (`1000000000000` of each denomination) are literals in the script. They
-are not environment variables, they are not in `.env.example`, and they cannot be
-overridden without editing `scripts/edgenet.sh` and rebuilding the image. If you
-need a different funded account, that is the edit. Promoting these to environment
-variables (something like `ACCOUNTS_TO_FUND` and `COINS_TO_FUND`) is an obvious
-improvement and has not been done.
+Which accounts get funded is now configurable: the validator's own account is
+always funded, and `FUNDED_ACCOUNTS` in `.env` adds any number of extra
+addresses on top (see step 9 above). What is still hardcoded is how much each
+funded account receives: `1000000000000` of `DENOM` and of `STAKE_DENOM` are
+literals in the `--coins-to-fund` argument in `scripts/edgenet.sh`. They are
+not environment variables, they are not in `.env.example`, and they cannot be
+overridden without editing the script and rebuilding the image. Promoting
+them to an environment variable (something like `COINS_TO_FUND`) is an
+obvious improvement and has not been done.
 
 ## 4. Testing
 
