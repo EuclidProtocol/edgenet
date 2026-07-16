@@ -14,7 +14,7 @@ STAKE_DENOM="${STAKE_DENOM:-usync}"
 # The check is only about quote characters, so an empty value passes it: that
 # matters for FUNDED_ACCOUNTS, which is legitimately empty when no extra
 # development accounts are configured.
-for var in BINARY CHAIN_ID DENOM STAKE_DENOM SNAPSHOT_URL FUNDED_ACCOUNTS; do
+for var in BINARY CHAIN_ID DENOM STAKE_DENOM SNAPSHOT_URL FUNDED_ACCOUNTS COSMWASM_ADMIN; do
     value="${!var:-}"
     case "$value" in
         *\"*|*\'*)
@@ -228,6 +228,11 @@ if [ -n "${FUNDED_ACCOUNTS:-}" ]; then
     ACCOUNTS_TO_FUND=$ACCOUNTS_TO_FUND,$FUNDED_ACCOUNTS
 fi
 
+# The cosmwasm admin defaults to the validator account so a bare .env still
+# yields a usable testnet; COSMWASM_ADMIN overrides it when contract migration
+# rights need to live on a different (e.g. externally held) account.
+COSMWASM_ADMIN="${COSMWASM_ADMIN:-$VAL_ACCOUNT}"
+
 # Written before in-place-testnet because in-place-testnet never returns (it converts
 # the restored state and then runs the node), so there is no "after" to write it in.
 # Accepted tradeoff: a conversion that dies partway leaves this sentinel over a
@@ -238,11 +243,12 @@ touch "$CHAIN_HOME/initialized"
 echo "🏁 Starting $CHAIN_ID..."
 echo "👤 Validator operator: $VAL_OPERATOR"
 echo "💰 Funding accounts: $ACCOUNTS_TO_FUND"
+echo "🛠️  Cosmwasm admin: $COSMWASM_ADMIN"
 $BINARY in-place-testnet $CHAIN_ID \
     --validator-operator=$VAL_OPERATOR \
     --validator-pubkey=$CONSENSUS_PUBKEY \
     --validator-privkey=$CONSENSUS_PRIVKEY \
     --accounts-to-fund=$ACCOUNTS_TO_FUND \
-    --cosmwasm-admin=$VAL_ACCOUNT \
+    --cosmwasm-admin=$COSMWASM_ADMIN \
     --home $CHAIN_HOME \
     --coins-to-fund 1000000000000$DENOM,1000000000000$STAKE_DENOM
