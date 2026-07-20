@@ -92,6 +92,15 @@ anvil-somnia-stop:
 anvil-somnia-logs:
 	@$(COMPOSE) logs -f anvil-somnia --since 10s
 
+anvil-polygon-start:
+	@$(COMPOSE) up -d --build anvil-polygon
+
+anvil-polygon-stop:
+	@$(COMPOSE) stop anvil-polygon
+
+anvil-polygon-logs:
+	@$(COMPOSE) logs -f anvil-polygon --since 10s
+
 # ──────────────────────────────────────────────────────────────
 # Housekeeping
 # ──────────────────────────────────────────────────────────────

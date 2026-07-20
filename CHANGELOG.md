@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- `anvil-base` and `anvil-somnia`'s `EVM_CHAIN_ID` changed from each chain's real mainnet id (Base 8453, Somnia 5031) to an offset id (84539, 50319), one digit inserted into the real value. Added `anvil-polygon` (port 8547) on the same scheme, `EVM_CHAIN_ID=1379` (Polygon's real mainnet id 137, offset the same way). The offset is deliberate: `--chain-id` overrides the id anvil would otherwise report over `eth_chainId`, and a fork reporting the real mainnet id risks a wallet or browser extension already configured for that chain mistaking the fork for it, same cached balances, same transaction history, wrong chain underneath. `README.md`, `DEVELOPER.md` and `scripts/anvil-fork-test.sh` are updated to the new ids and to state plainly that `--chain-id` changes observable behaviour, rather than the previous claim that passing it was redundant.
+
 ### Added
 
 - Initial standalone edgenet stack, ported from lumen-bootstrap.

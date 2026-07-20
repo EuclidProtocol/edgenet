@@ -13,8 +13,9 @@
 #                 per transaction and never produces an empty block, which no
 #                 real chain does.
 #   EVM_CHAIN_ID  EVM chain id anvil reports over eth_chainId. Not inherited
-#                 from the fork, so it must be given explicitly (Base mainnet
-#                 8453, Somnia mainnet 5031).
+#                 from the fork, so it must be given explicitly. These are
+#                 mainnet-offset fork ids, not the real mainnet chain ids
+#                 (Base 84539, Somnia 50319, Polygon 1379).
 #
 # Optional environment:
 #   FORK_BLOCK    Block number to fork at. When empty or unset, anvil

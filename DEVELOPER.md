@@ -14,11 +14,12 @@ Lumen chain and relaunches it as a single validator local network via the
 `in-place-testnet` subcommand. It publishes 26657 (RPC), 1317 (LCD) and 9090
 (gRPC).
 
-**The anvil forks (`anvil-base`, `anvil-somnia`).** One service per EVM chain,
-all built from the same `Dockerfile.anvil` and all running
-`scripts/anvil-fork.sh` as their entrypoint. Each one forks a public EVM chain
-either at the current chain tip or at a block height pinned in `.env`. Base
-listens on 8545, Somnia on 8546.
+**The anvil forks (`anvil-base`, `anvil-somnia`, `anvil-polygon`).** One
+service per EVM chain, all built from the same `Dockerfile.anvil` and all
+running `scripts/anvil-fork.sh` as their entrypoint. Each one forks a public
+EVM chain either at the current chain tip or at a block height pinned in
+`.env`. Base listens on host port 8545, Somnia on 8546, Polygon on 8547;
+every container listens on 8545 internally.
 
 The two kinds differ only in role. All anvil services share one image and one
 script; they are distinguished purely by environment (`CHAIN_NAME`,
@@ -110,24 +111,37 @@ flag) makes the fork tick on a fixed interval regardless of transaction
 activity, the same way the upstream chain does. This was the single biggest
 realism gap in the fork and closing it is the point of this change.
 `BLOCK_TIME` is hardcoded per service in `docker-compose.yml`, 2 for
-`anvil-base` and 1 for `anvil-somnia`, rather than living in `.env`, because it
+`anvil-base`, 1 for `anvil-somnia` and 2 for `anvil-polygon`, rather than
+living in `.env`, because it
 is a property of how closely the fork should track the upstream chain's own
 cadence, not something a deployment should tune.
 
-### `--chain-id` is redundant, and passed on purpose anyway
+### `--chain-id` overrides the fork's reported chain id, on purpose
 
-Unlike `--block-time`, `--chain-id` fixes nothing. Anvil inherits the chain id
-from the chain it forks. Run `ghcr.io/foundry-rs/foundry:stable` forking
-`https://mainnet.base.org` with no `--chain-id` flag at all and query
-`eth_chainId`, and it answers `0x2105`, which is 8453, Base's real chain id.
-Passing `EVM_CHAIN_ID` does not change observable behaviour for either fork
-we run today, and this document is not going to pretend otherwise.
+Anvil does not have to inherit the chain id from the chain it forks. Run
+`ghcr.io/foundry-rs/foundry:stable` forking `https://mainnet.base.org` with
+no `--chain-id` flag at all and query `eth_chainId`, and it answers `0x2105`,
+which is 8453, Base's real mainnet chain id. Pass `--chain-id 84539` instead,
+and the fork answers `84539`. The flag is not decorative: it changes what
+every client of the fork, including a wallet, sees over `eth_chainId`.
 
-It is passed anyway, for two honest and fairly modest reasons:
+That override is the whole reason `EVM_CHAIN_ID` is passed at all. Each fork
+answers with its real mainnet chain id plus one inserted digit (Base 8453
+becomes 84539, Somnia 5031 becomes 50319, Polygon 137 becomes 1379), never
+the real id itself. A wallet or browser extension keys its network list and
+cached state off chain id. If a local fork answered the real mainnet id, a
+wallet already configured for Base (or Somnia, or Polygon) mainnet would
+treat the fork as that same network: same cached balances, same transaction
+history, same trust assumptions, wrong chain underneath. The offset id keeps
+the fork mechanically distinct from the network it mirrors, so no wallet
+already pointed at the real chain can mistake one for the other.
+
+Two smaller benefits fall out of passing the flag explicitly rather than
+picking the offset id some other way:
 
 * It makes the value **explicit and reviewable in `docker-compose.yml`**
   rather than implicit in whatever the upstream RPC happens to answer. A
-  reader of the compose file can see what chain each service claims to be
+  reader of the compose file can see what chain id each service reports
   without going and asking an RPC endpoint.
 * It **pins the fork's identity** if `FORK_RPC_URL` is ever repointed at a
   proxy, a testnet, or any endpoint that answers `eth_chainId` differently
@@ -135,15 +149,13 @@ It is passed anyway, for two honest and fairly modest reasons:
   it is configured with instead of quietly adopting whatever the new endpoint
   says.
 
-That is the entire justification. If you are weighing whether to keep the
-flag, weigh it on those two grounds, not on a correctness claim, because
-there isn't one.
-
 ### Why the variable is `EVM_CHAIN_ID` and not `CHAIN_ID`
 
-The values themselves (Base mainnet 8453, Somnia mainnet 5031) were queried
+The real mainnet values (Base 8453, Somnia 5031, Polygon 137) were queried
 live from the respective RPC endpoints via `eth_chainId` rather than copied
-from memory. The variable carrying them is named `EVM_CHAIN_ID` rather than
+from memory, then each offset by one inserted digit (84539, 50319, 1379) for
+the id actually configured, so the fork never reports the real chain's id.
+The variable carrying them is named `EVM_CHAIN_ID` rather than
 `CHAIN_ID` because `CHAIN_ID` already names something else in this stack: the
 Cosmos chain id (`lumen-1`) consumed by the `edgenet` service. Reusing
 `CHAIN_ID` for anvil would put two unrelated identifiers, one Cosmos, one EVM,
@@ -175,7 +187,7 @@ as a known gap in section 7.
 
 Because there is no metadata fetch and no search, `scripts/anvil-fork.sh` has no
 way to know what wall clock time the Lumen snapshot represents, and does not try
-to find out. `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` and the Lumen snapshot
+to find out. `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` / `POLYGON_FORK_BLOCK` and the Lumen snapshot
 chosen via `SNAPSHOT_URL` are configured completely independently. Keeping them
 consistent (so that the Cosmos side and the EVM side represent roughly the same
 moment) is now something the operator has to do by hand, by picking the fork
@@ -378,9 +390,9 @@ What it covers:
 * **`--block-time` and `--chain-id` are passed on both branches**, tip and
   pinned, with the exact values from `BLOCK_TIME` and `EVM_CHAIN_ID`, and the
   log line announces both (`chain id <id>`, `mining every <n>s`). A second
-  case runs the entrypoint as Somnia (`BLOCK_TIME=1`, `EVM_CHAIN_ID=5031`) to
-  confirm the values are read from the environment per chain, not hardcoded
-  to Base's.
+  case runs the entrypoint as Somnia (`BLOCK_TIME=1`, `EVM_CHAIN_ID=50319`),
+  and a third as Polygon (`BLOCK_TIME=2`, `EVM_CHAIN_ID=1379`), to confirm the
+  values are read from the environment per chain, not hardcoded to Base's.
 * **Malformed `FORK_BLOCK` is fatal before anvil starts.** Covers
   `not-a-number`, `-5`, `1.5`, `0`, and `0x10`; each must exit non zero with
   `positive integer block number` in the output, and the anvil stub must never
@@ -494,12 +506,16 @@ There is no per chain timing variable to add anymore.
 
 **2. `docker-compose.yml`.** Add a service, starting from `anvil-base` as a
 template. The service name, `CHAIN_NAME`, the two `.env` backed variable
-names, and the port all change the same way they did before. Two more values
-now need to be set as literals, `BLOCK_TIME` and `EVM_CHAIN_ID`: these are not
-copied from `anvil-base`, they are facts about Arbitrum itself (its own block
-time in whole seconds, and its own EVM chain id, queried live via
-`eth_chainId`), the same way Base carries `2`/`8453` and Somnia carries
-`1`/`5031`. Pick a port not already used (8545 and 8546 are taken).
+names, and the host port all change the same way they did before. Two more
+values now need to be set as literals, `BLOCK_TIME` and `EVM_CHAIN_ID`: these
+are not copied from `anvil-base`, they are facts about Arbitrum itself (its
+own block time in whole seconds, and its own EVM chain id, queried live via
+`eth_chainId`), the same way Base carries `2`/`84539` (Base's real mainnet id
+8453, offset by one inserted digit), Somnia carries `1`/`50319` (Somnia's
+real mainnet id 5031, offset the same way) and Polygon carries `2`/`1379`
+(Polygon's real mainnet id 137, offset the same way). Pick a free host port (8545,
+8546 and 8547 are taken); `ANVIL_PORT` itself stays `8545`, the same as
+every other anvil service.
 
 ```yaml
   anvil-arbitrum:
@@ -517,16 +533,18 @@ time in whole seconds, and its own EVM chain id, queried live via
       - FORK_BLOCK=${ARBITRUM_FORK_BLOCK}
       - BLOCK_TIME=1
       - EVM_CHAIN_ID=42161
-      - ANVIL_PORT=8547
+      - ANVIL_PORT=8545
     ports:
-      - 8547:8547
+      - 8548:8545
     networks:
       - edgenet-network
     restart: on-failure
 ```
 
-Note `ANVIL_PORT` and the published port must match, because the port mapping is
-`8547:8547`. `BLOCK_TIME` and `EVM_CHAIN_ID` are both required by
+`ANVIL_PORT` does not need to match the published port; every anvil container
+listens on `8545` internally regardless of which chain it forks, and only the
+host side of the mapping, `8548` here, has to be free and distinct per
+service. `BLOCK_TIME` and `EVM_CHAIN_ID` are both required by
 `scripts/anvil-fork.sh`; a missing, non-positive-integer, or quote-containing
 value is fatal before anvil starts, see section 2.
 
@@ -598,9 +616,10 @@ None of these are blocking. All of them are real.
   interactive `docker exec` debugging, say so next to the `RUN apt-get install`
   line.
 * **Anvil forks and the Lumen snapshot can silently drift apart.** Nothing
-  ties `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` to the snapshot selected by
-  `SNAPSHOT_URL`; see section 2. There is no validation, warning, or check of
-  any kind if an operator changes one without the other.
+  ties `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` / `POLYGON_FORK_BLOCK` to the
+  snapshot selected by `SNAPSHOT_URL`; see section 2. There is no validation,
+  warning, or check of any kind if an operator changes one without the
+  others.
 * **`anvil-somnia` cannot tick as fast as the real Somnia chain.** Anvil's
   `--block-time` only accepts whole seconds, so `anvil-somnia` runs at the
   smallest value anvil supports, `BLOCK_TIME=1`, while Somnia's real block
@@ -635,7 +654,7 @@ than `lumend`. The quoted value was baked into `ENV HOME` at image build time
 (section 3, step 1), so the entrypoint's own cleanup step collides with the
 mount instead of removing it cleanly.
 
-**anvil containers (`anvil-base`, `anvil-somnia`):**
+**anvil containers (`anvil-base`, `anvil-somnia`, `anvil-polygon`):**
 
 ```
 FATAL: environment variable FORK_RPC_URL contains a literal quote character

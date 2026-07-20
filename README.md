@@ -10,7 +10,7 @@ For internals (the fork boot sequence, the snapshot metadata contract, the self-
 
 * **Docker** with **Compose v2** (`docker compose`, not `docker-compose`) and **BuildKit**. The Makefile sets `DOCKER_BUILDKIT=1` for you.
 * **make**.
-* **Free host ports**: `26657`, `1317`, `9090`, `8545`, `8546`.
+* **Free host ports**: `26657`, `1317`, `9090`, `8545`, `8546`, `8547`.
 * **Network egress**. The build downloads the Lumen binary and genesis file, and at runtime the node fetches snapshot metadata and downloads a compressed chain snapshot while each anvil service dials its upstream EVM RPC to fork from.
 * **A validator mnemonic**. `VALIDATOR_MNEMONIC` is the only variable in `.env.example` with no working default. Nothing starts without it.
 * **The right `PLATFORM`**. `.env.example` ships `x86_64`. On Apple Silicon you must change it to `arm64`, otherwise the build pulls a binary that will not run.
@@ -39,6 +39,7 @@ Once the stack is up:
 | Lumen gRPC | `localhost:9090` |
 | Base fork | `http://localhost:8545` |
 | Somnia fork | `http://localhost:8546` |
+| Polygon fork | `http://localhost:8547` |
 
 ## Services
 
@@ -47,8 +48,9 @@ Once the stack is up:
 | `edgenet` | `Dockerfile.edgenet` | 26657 (RPC), 1317 (LCD), 9090 (gRPC) |
 | `anvil-base` | `Dockerfile.anvil` | 8545 |
 | `anvil-somnia` | `Dockerfile.anvil` | 8546 |
+| `anvil-polygon` | `Dockerfile.anvil` | 8547 |
 
-All three share the `edgenet-network` Docker network and the `edgenet` compose profile, which is why one `make edgenet` starts all of them. All three restart `on-failure`.
+All four share the `edgenet-network` Docker network and the `edgenet` compose profile, which is why one `make edgenet` starts all of them. All four restart `on-failure`.
 
 Every anvil service runs the same image (`edgenet-anvil:local`, built once from `Dockerfile.anvil`, containing foundry, curl and jq). Services differ only by environment variables, never by Dockerfile. Each one starts through `scripts/anvil-fork.sh`.
 
@@ -107,6 +109,14 @@ make anvil-somnia-stop
 make anvil-somnia-logs
 ```
 
+**Polygon fork only:**
+
+```sh
+make anvil-polygon-start  # build and start, detached
+make anvil-polygon-stop
+make anvil-polygon-logs
+```
+
 **Housekeeping:**
 
 ```sh
@@ -138,10 +148,12 @@ The validator moniker is hard coded to `validator` in `docker-compose.yml` and i
 | --- | --- | --- |
 | `BASE_FORK_RPC_URL` | `https://mainnet.base.org` | Upstream JSON-RPC endpoint that `anvil-base` forks. |
 | `SOMNIA_FORK_RPC_URL` | `https://api.infra.mainnet.somnia.network` | Upstream JSON-RPC endpoint that `anvil-somnia` forks. |
+| `POLYGON_FORK_RPC_URL` | `https://polygon-bor-rpc.publicnode.com` | Upstream JSON-RPC endpoint that `anvil-polygon` forks. |
 | `BASE_FORK_BLOCK` | *(empty)* | Block height `anvil-base` forks at. Empty (the default) means anvil forks the upstream chain's current tip. Set it to a positive integer to pin a specific block. A non-integer value is fatal. |
 | `SOMNIA_FORK_BLOCK` | *(empty)* | Block height `anvil-somnia` forks at. Same rules as `BASE_FORK_BLOCK`. |
+| `POLYGON_FORK_BLOCK` | *(empty)* | Block height `anvil-polygon` forks at. Same rules as `BASE_FORK_BLOCK`. |
 
-**Anvil forks are not automatically aligned with the Lumen snapshot.** Pinning `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` and choosing which Lumen snapshot to restore (via `SNAPSHOT_URL`) are two independent settings; nothing in the stack keeps them in sync. If your workflow needs the Cosmos and EVM sides to reflect a consistent point in time, you have to work out the corresponding block height on each upstream chain yourself (for example from a block explorer, by matching timestamps) and set `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` accordingly. Leaving both empty is the simplest option when that alignment does not matter to you, at the cost of the forks drifting from whatever moment the snapshot represents.
+**Anvil forks are not automatically aligned with the Lumen snapshot.** Pinning `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` / `POLYGON_FORK_BLOCK` and choosing which Lumen snapshot to restore (via `SNAPSHOT_URL`) are two independent settings; nothing in the stack keeps them in sync. If your workflow needs the Cosmos and EVM sides to reflect a consistent point in time, you have to work out the corresponding block height on each upstream chain yourself (for example from a block explorer, by matching timestamps) and set `BASE_FORK_BLOCK` / `SOMNIA_FORK_BLOCK` / `POLYGON_FORK_BLOCK` accordingly. Leaving all empty is the simplest option when that alignment does not matter to you, at the cost of the forks drifting from whatever moment the snapshot represents.
 
 ### Variables passed to each anvil container
 
@@ -152,9 +164,9 @@ The validator moniker is hard coded to `validator` in `docker-compose.yml` and i
 | `CHAIN_NAME` | Label for the chain. **Logging only.** Nothing is looked up or resolved by it. Set literally in `docker-compose.yml`, not in `.env`. |
 | `FORK_RPC_URL` | Upstream RPC endpoint to fork. |
 | `FORK_BLOCK` | Block height to fork at, sourced from `<NAME>_FORK_BLOCK`. Empty or unset means fork the chain tip. |
-| `BLOCK_TIME` | Seconds between blocks, passed to anvil as `--block-time`. A fact about the upstream chain (Base 2, Somnia 1), set literally in `docker-compose.yml`, not in `.env`. Required; must be a positive integer. |
-| `EVM_CHAIN_ID` | EVM chain id anvil reports over `eth_chainId`, passed as `--chain-id`. Set literally in `docker-compose.yml` (Base 8453, Somnia 5031, both queried live via `eth_chainId`), not in `.env`. Redundant for the current forks: anvil already inherits the chain id from the chain it forks, so it would report the same value without this flag. It is passed to keep the value explicit in compose rather than implicit in whatever the upstream RPC answers. Named `EVM_CHAIN_ID` rather than `CHAIN_ID` because `CHAIN_ID` already names the Cosmos chain id on the `edgenet` service. Required by the script; must be a positive integer. |
-| `ANVIL_PORT` | Port anvil listens on **inside the container**. The host port comes from the compose `ports:` mapping, which is a separate setting. They happen to match one to one today (8545 and 8546), and keeping them matched is the sane convention, but nothing enforces it. |
+| `BLOCK_TIME` | Seconds between blocks, passed to anvil as `--block-time`. A fact about the upstream chain (Base 2, Somnia 1, Polygon 2), set literally in `docker-compose.yml`, not in `.env`. Required; must be a positive integer. |
+| `EVM_CHAIN_ID` | EVM chain id anvil reports over `eth_chainId`, passed as `--chain-id`, which overrides whatever the fork would otherwise inherit from the upstream chain. Set literally in `docker-compose.yml`: Base 84539, Somnia 50319, Polygon 1379, each the real mainnet chain id (8453, 5031, 137) with a digit inserted, not the real id itself. The offset is deliberate: a wallet or browser extension keys its network list off chain id, and a fork reporting the real mainnet id could be mistaken by an already configured wallet for that same network. Named `EVM_CHAIN_ID` rather than `CHAIN_ID` because `CHAIN_ID` already names the Cosmos chain id on the `edgenet` service. Required by the script; must be a positive integer. |
+| `ANVIL_PORT` | Port anvil listens on **inside the container**. Every anvil service sets this to `8545`; all three containers listen on the same internal port. The host port comes from the compose `ports:` mapping, a separate setting, and is what actually tells the forks apart from the host side: `8545` for `anvil-base`, `8546` for `anvil-somnia`, `8547` for `anvil-polygon`. Host and container port no longer need to match, and today they only do for `anvil-base`. |
 
 ## Adding an EVM chain
 
@@ -169,7 +181,7 @@ One `<NAME>_FORK_RPC_URL` line and one `<NAME>_FORK_BLOCK` line in `.env`, plus 
 
    Leave `ARBITRUM_FORK_BLOCK` empty to fork the chain tip, or set it to a pinned block number. `BLOCK_TIME` and `EVM_CHAIN_ID` do not go in `.env`; see the next step.
 
-2. Add a service block to `docker-compose.yml`, picking a free port. `BLOCK_TIME` (whole seconds) and `EVM_CHAIN_ID` are facts about the chain being forked, not deployment configuration, so they are set as literals here, the same way `CHAIN_NAME` already is; look up the chain's real block time and query its real chain id via `eth_chainId` rather than guessing:
+2. Add a service block to `docker-compose.yml`, picking a free host port. `BLOCK_TIME` (whole seconds) and `EVM_CHAIN_ID` are facts about the chain being forked, not deployment configuration, so they are set as literals here, the same way `CHAIN_NAME` already is; look up the chain's real block time and query its real chain id via `eth_chainId` rather than guessing:
 
    ```yaml
    anvil-arbitrum:
@@ -187,15 +199,15 @@ One `<NAME>_FORK_RPC_URL` line and one `<NAME>_FORK_BLOCK` line in `.env`, plus 
        - FORK_BLOCK=${ARBITRUM_FORK_BLOCK}
        - BLOCK_TIME=1
        - EVM_CHAIN_ID=42161
-       - ANVIL_PORT=8547
+       - ANVIL_PORT=8545
      ports:
-       - 8547:8547
+       - 8548:8545
      networks:
        - edgenet-network
      restart: on-failure
    ```
 
-   Keep `ANVIL_PORT` and the `ports:` mapping in agreement. `BLOCK_TIME` and `EVM_CHAIN_ID` are both required by `scripts/anvil-fork.sh`; a missing, non positive integer, or quote containing value is fatal before anvil starts.
+   `ANVIL_PORT` stays `8545`, matching every other anvil service; only the host side of `ports:` needs to be free, and it no longer needs to match `ANVIL_PORT`. `BLOCK_TIME` and `EVM_CHAIN_ID` are both required by `scripts/anvil-fork.sh`; a missing, non positive integer, or quote containing value is fatal before anvil starts.
 
 3. Optionally add `anvil-arbitrum-start`, `anvil-arbitrum-stop` and `anvil-arbitrum-logs` targets to the `Makefile`, mirroring the existing ones.
 
@@ -229,7 +241,7 @@ Because `CHAIN_HOME` is a bind mount (`./.config/${CHAIN_ID}_edgenet/`), the sen
 
 `scripts/anvil-fork.sh` is the entrypoint of every anvil container. If `FORK_BLOCK` is set to a positive integer, it execs anvil with `--fork-url` and `--fork-block-number` pinned to that value. If `FORK_BLOCK` is empty or unset, it execs anvil with `--fork-url` only, so anvil forks the upstream chain's current tip. A non-integer `FORK_BLOCK` is fatal before anvil starts.
 
-Both branches also pass `--block-time "$BLOCK_TIME"` and `--chain-id "$EVM_CHAIN_ID"`. Both are required: a missing, non-positive-integer, or quote-containing value is fatal before anvil starts, same as a malformed `FORK_BLOCK`. Without `--block-time`, anvil auto-mines a block on every transaction and produces no empty blocks, so an idle fork never advances; with it, the fork ticks on a fixed interval like a real chain. `--chain-id` is a weaker case and is worth stating plainly: anvil already inherits the chain id from the chain it forks, so a fork of Base reports 8453 over `eth_chainId` with or without the flag, and passing `EVM_CHAIN_ID` changes nothing observable today. It is passed because it makes the value explicit and reviewable in `docker-compose.yml` instead of implicit in whatever the upstream RPC happens to answer, and because it keeps the fork's identity pinned if `FORK_RPC_URL` is ever repointed at a proxy, a testnet, or an endpoint that answers differently. Both values are hardcoded per service in `docker-compose.yml` (`anvil-base`: 2 seconds and chain id 8453; `anvil-somnia`: 1 second and chain id 5031), not sourced from `.env`, because they are facts about the upstream chain rather than deployment configuration; the chain ids were queried live from each RPC endpoint via `eth_chainId`. Deliberately not overridden: anvil already inherits gas limit, base fee, hardfork and code size limit from the forked chain, and its own defaults for transaction ordering and epoch length are already realistic, so none of those were touched. One caveat: anvil's block time only accepts whole seconds, so `anvil-somnia`, whose real block time is well under a second, still ticks slower than the real chain; see [DEVELOPER.md](DEVELOPER.md#7-known-gaps-and-cleanup-backlog) for this and other known gaps.
+Both branches also pass `--block-time "$BLOCK_TIME"` and `--chain-id "$EVM_CHAIN_ID"`. Both are required: a missing, non-positive-integer, or quote-containing value is fatal before anvil starts, same as a malformed `FORK_BLOCK`. Without `--block-time`, anvil auto-mines a block on every transaction and produces no empty blocks, so an idle fork never advances; with it, the fork ticks on a fixed interval like a real chain. `--chain-id` is not a no-op: anvil does not have to inherit the chain id from the chain it forks, and the flag overrides whatever it would otherwise report. A fork of Base with no `--chain-id` flag reports 8453 over `eth_chainId`; passed as `--chain-id 84539`, it reports 84539 instead. That override is the reason `EVM_CHAIN_ID` is passed at all: each fork's real mainnet chain id (Base 8453, Somnia 5031, Polygon 137) is offset by one inserted digit (84539, 50319, 1379) rather than reported as is, so a wallet or browser extension already configured for the real chain cannot mistake the fork for it. Both values are hardcoded per service in `docker-compose.yml` (`anvil-base`: 2 seconds and chain id 84539; `anvil-somnia`: 1 second and chain id 50319; `anvil-polygon`: 2 seconds and chain id 1379), not sourced from `.env`, because they are facts about the upstream chain rather than deployment configuration; the real chain ids were queried live from each RPC endpoint via `eth_chainId` before being offset. Deliberately not overridden: anvil already inherits gas limit, base fee, hardfork and code size limit from the forked chain, and its own defaults for transaction ordering and epoch length are already realistic, so none of those were touched. One caveat: anvil's block time only accepts whole seconds, so `anvil-somnia`, whose real block time is well under a second, still ticks slower than the real chain; see [DEVELOPER.md](DEVELOPER.md#7-known-gaps-and-cleanup-backlog) for this and other known gaps.
 
 There is no lookup against the Lumen snapshot: the fork height and the snapshot are configured independently, see [Anvil forks](#anvil-forks) above for what that means for keeping them consistent.
 
@@ -256,10 +268,10 @@ This is expected right now, not a bug in this repo: the `_edgenet` build has not
 `VALIDATOR_MNEMONIC` is empty or invalid. It has no default.
 
 **A port is already allocated.**
-Free 26657, 1317, 9090, 8545 or 8546, or change the `ports:` mapping in `docker-compose.yml` (and `ANVIL_PORT` alongside it for an anvil service).
+Free 26657, 1317, 9090, 8545, 8546 or 8547, or change the host side of the `ports:` mapping in `docker-compose.yml` (for an anvil service the container side stays `8545`, matching `ANVIL_PORT`).
 
 **Anvil exits with `FORK_BLOCK must be a positive integer block number`.**
-`BASE_FORK_BLOCK` or `SOMNIA_FORK_BLOCK` is set to something other than a positive integer. Leave it empty to fork the chain tip, or set it to a plain block number.
+`BASE_FORK_BLOCK`, `SOMNIA_FORK_BLOCK` or `POLYGON_FORK_BLOCK` is set to something other than a positive integer. Leave it empty to fork the chain tip, or set it to a plain block number.
 
 **Anvil exits with `BLOCK_TIME must be a positive integer` or `EVM_CHAIN_ID must be a positive integer`.**
 `BLOCK_TIME` and `EVM_CHAIN_ID` are literals in `docker-compose.yml`, not `.env` values, so this points at an edit made there (or at a new service added while [adding an EVM chain](#adding-an-evm-chain)) rather than at anything in `.env`. Both must be plain positive integers.
