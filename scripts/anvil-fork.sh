@@ -20,6 +20,12 @@
 # Optional environment:
 #   FORK_BLOCK    Block number to fork at. When empty or unset, anvil
 #                 forks at the chain tip.
+#
+# anvil is always started with --timestamp set to the current wall-clock
+# unix time, so the forked chain's clock starts at "now" rather than at the
+# forked block's original timestamp. On a restart that reloads persisted
+# /data/state, this flag is a no-op: anvil resumes the state's own clock,
+# it does not rewind to a fresh --timestamp.
 
 set -euo pipefail
 
@@ -61,25 +67,34 @@ main() {
     --preserve-historical-states
   )
 
+  # Wall-clock unix time, not the forked chain's own timestamp: a fork of an
+  # old block should still tick from "now" so relative-time assumptions in
+  # anything talking to this chain hold. Only has effect on the first boot;
+  # a restart that reloads /data/state resumes the state's clock instead.
+  local TIMESTAMP
+  TIMESTAMP=$(date +%s)
+
   if [[ -n "${FORK_BLOCK:-}" ]]; then
     [[ "$FORK_BLOCK" =~ ^[1-9][0-9]*$ ]] \
       || die "FORK_BLOCK must be a positive integer block number, got '$FORK_BLOCK'"
-    log "forking '$CHAIN_NAME' (chain id $EVM_CHAIN_ID) at pinned block $FORK_BLOCK, mining every ${BLOCK_TIME}s"
+    log "forking '$CHAIN_NAME' (chain id $EVM_CHAIN_ID) at pinned block $FORK_BLOCK, mining every ${BLOCK_TIME}s, clock starting at $TIMESTAMP"
     exec anvil \
       --fork-url "$FORK_RPC_URL" \
       --fork-block-number "$FORK_BLOCK" \
       --block-time "$BLOCK_TIME" \
       --chain-id "$EVM_CHAIN_ID" \
+      --timestamp "$TIMESTAMP" \
       --host 0.0.0.0 \
       --port "$ANVIL_PORT" \
       "${STATE_FLAGS[@]}"
   fi
 
-  log "FORK_BLOCK is not set; forking '$CHAIN_NAME' (chain id $EVM_CHAIN_ID) at the chain tip, mining every ${BLOCK_TIME}s"
+  log "FORK_BLOCK is not set; forking '$CHAIN_NAME' (chain id $EVM_CHAIN_ID) at the chain tip, mining every ${BLOCK_TIME}s, clock starting at $TIMESTAMP"
   exec anvil \
     --fork-url "$FORK_RPC_URL" \
     --block-time "$BLOCK_TIME" \
     --chain-id "$EVM_CHAIN_ID" \
+    --timestamp "$TIMESTAMP" \
     --host 0.0.0.0 \
     --port "$ANVIL_PORT" \
     "${STATE_FLAGS[@]}"

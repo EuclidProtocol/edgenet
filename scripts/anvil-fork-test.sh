@@ -99,6 +99,17 @@ if [[ "$RUN_OUT" == *"chain id 84539"* && "$RUN_OUT" == *"every 2s"* ]]; then
 else
   fail "tip mode: log announces the chain id and the block time (got: $RUN_OUT)"
 fi
+# --timestamp must always reach anvil, with the current wall-clock unix time,
+# not a value taken from an env var (there is none) and not the forked
+# block's own timestamp.
+now=$(date +%s)
+ts_line=$(printf '%s\n' "$RUN_OUT" | grep -A1 '^arg:--timestamp$' | tail -n1)
+ts=${ts_line#arg:}
+if [[ "$ts" =~ ^[0-9]+$ ]] && (( ts >= now - 30 && ts <= now + 30 )); then
+  pass "tip mode: --timestamp is passed as the current unix time"
+else
+  fail "tip mode: --timestamp is passed as the current unix time (got: '$ts', now=$now)"
+fi
 # State persistence flags must reach anvil so the chain survives restarts. The
 # path is the container side of the per-fork /data bind mount.
 if [[ "$RUN_OUT" == *"arg:--state
@@ -152,6 +163,16 @@ if [[ "$RUN_OUT" == *"chain id 84539"* && "$RUN_OUT" == *"every 2s"* ]]; then
   pass "pinned mode: log announces the chain id and the block time"
 else
   fail "pinned mode: log announces the chain id and the block time (got: $RUN_OUT)"
+fi
+# --timestamp on the pinned branch too: the two `exec anvil` lines are
+# independent, so the flag being present on tip mode proves nothing here.
+now=$(date +%s)
+ts_line=$(printf '%s\n' "$RUN_OUT" | grep -A1 '^arg:--timestamp$' | tail -n1)
+ts=${ts_line#arg:}
+if [[ "$ts" =~ ^[0-9]+$ ]] && (( ts >= now - 30 && ts <= now + 30 )); then
+  pass "pinned mode: --timestamp is passed as the current unix time"
+else
+  fail "pinned mode: --timestamp is passed as the current unix time (got: '$ts', now=$now)"
 fi
 # The two branches are separate `exec anvil` lines, so the state flags need
 # asserting on the pinned branch too, not just the tip one.
