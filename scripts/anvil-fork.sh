@@ -51,6 +51,16 @@ main() {
   [[ "$EVM_CHAIN_ID" =~ ^[1-9][0-9]*$ ]] \
     || die "EVM_CHAIN_ID must be a positive integer chain id, got '$EVM_CHAIN_ID'"
 
+  # Persist chain state under the bind-mounted /data so it survives container
+  # restarts. anvil loads /data/state on boot if present, dumps to it every 60s
+  # and on exit; --preserve-historical-states keeps the per-block snapshots the
+  # fork accumulates so a reload restores history, not just the latest state.
+  local STATE_FLAGS=(
+    --state /data/state
+    --state-interval 60
+    --preserve-historical-states
+  )
+
   if [[ -n "${FORK_BLOCK:-}" ]]; then
     [[ "$FORK_BLOCK" =~ ^[1-9][0-9]*$ ]] \
       || die "FORK_BLOCK must be a positive integer block number, got '$FORK_BLOCK'"
@@ -61,7 +71,8 @@ main() {
       --block-time "$BLOCK_TIME" \
       --chain-id "$EVM_CHAIN_ID" \
       --host 0.0.0.0 \
-      --port "$ANVIL_PORT"
+      --port "$ANVIL_PORT" \
+      "${STATE_FLAGS[@]}"
   fi
 
   log "FORK_BLOCK is not set; forking '$CHAIN_NAME' (chain id $EVM_CHAIN_ID) at the chain tip, mining every ${BLOCK_TIME}s"
@@ -70,7 +81,8 @@ main() {
     --block-time "$BLOCK_TIME" \
     --chain-id "$EVM_CHAIN_ID" \
     --host 0.0.0.0 \
-    --port "$ANVIL_PORT"
+    --port "$ANVIL_PORT" \
+    "${STATE_FLAGS[@]}"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then

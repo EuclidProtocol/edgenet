@@ -1,7 +1,10 @@
 # Shared image for every anvil fork service. Services differ only by
 # environment variables (CHAIN_NAME, FORK_RPC_URL, FORK_BLOCK, ANVIL_PORT),
 # never by Dockerfile.
-FROM ghcr.io/foundry-rs/foundry:stable AS foundry
+# Pinned to an exact foundry release, not the moving :stable tag, because anvil
+# state dumps are loaded back on restart and that dump format is not guaranteed
+# stable across anvil versions; a silent :stable bump could fail to reload state.
+FROM ghcr.io/foundry-rs/foundry:v1.7.1 AS foundry
 
 FROM ubuntu:24.04
 

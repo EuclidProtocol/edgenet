@@ -2,8 +2,13 @@
 
 ## Unreleased
 
+### Added
+
+- Anvil forks now persist their chain state across container restarts. `scripts/anvil-fork.sh` passes `--state /data/state --state-interval 60 --preserve-historical-states` to anvil on both the pinned and tip branches. Anvil loads `/data/state` on boot when it exists, dumps to it every 60 seconds and on exit, and `--preserve-historical-states` keeps the per block snapshots the fork accumulates so a reload restores history rather than only the latest state. `docker-compose.yml` bind mounts a per fork host directory at that path, keyed by each service's literal `EVM_CHAIN_ID` (`anvil-base` mounts `./data/84539`, `anvil-somnia` `./data/50319`, `anvil-polygon` `./data/1379`), all onto the container's `/data`. `data/` is git ignored, one subdirectory per fork. `scripts/anvil-fork-test.sh` asserts the three state flags reach anvil on both branches.
+
 ### Changed
 
+- `Dockerfile.anvil` pins the foundry base image to the exact release `ghcr.io/foundry-rs/foundry:v1.7.1` instead of the moving `:stable` tag. Anvil's state dump is loaded back on restart and its format is not guaranteed stable across anvil versions, so a silent `:stable` bump could leave a fork unable to reload the state it just dumped. `v1.7.1` is the tag `:stable` currently resolves to.
 - `anvil-base` and `anvil-somnia`'s `EVM_CHAIN_ID` changed from each chain's real mainnet id (Base 8453, Somnia 5031) to an offset id (84539, 50319), one digit inserted into the real value. Added `anvil-polygon` (port 8547) on the same scheme, `EVM_CHAIN_ID=1379` (Polygon's real mainnet id 137, offset the same way). The offset is deliberate: `--chain-id` overrides the id anvil would otherwise report over `eth_chainId`, and a fork reporting the real mainnet id risks a wallet or browser extension already configured for that chain mistaking the fork for it, same cached balances, same transaction history, wrong chain underneath. `README.md`, `DEVELOPER.md` and `scripts/anvil-fork-test.sh` are updated to the new ids and to state plainly that `--chain-id` changes observable behaviour, rather than the previous claim that passing it was redundant.
 
 ### Added

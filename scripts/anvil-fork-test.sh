@@ -99,6 +99,15 @@ if [[ "$RUN_OUT" == *"chain id 84539"* && "$RUN_OUT" == *"every 2s"* ]]; then
 else
   fail "tip mode: log announces the chain id and the block time (got: $RUN_OUT)"
 fi
+# State persistence flags must reach anvil so the chain survives restarts. The
+# path is the container side of the per-fork /data bind mount.
+if [[ "$RUN_OUT" == *"arg:--state
+arg:/data/state"* && "$RUN_OUT" == *"arg:--state-interval
+arg:60"* && "$RUN_OUT" == *"arg:--preserve-historical-states"* ]]; then
+  pass "tip mode: --state /data/state --state-interval 60 --preserve-historical-states are passed"
+else
+  fail "tip mode: state persistence flags are passed (got: $RUN_OUT)"
+fi
 
 # 2. FORK_BLOCK set but empty: same as unset (compose passes empty strings
 #    for undefined .env vars, so empty must mean tip, not an error).
@@ -143,6 +152,15 @@ if [[ "$RUN_OUT" == *"chain id 84539"* && "$RUN_OUT" == *"every 2s"* ]]; then
   pass "pinned mode: log announces the chain id and the block time"
 else
   fail "pinned mode: log announces the chain id and the block time (got: $RUN_OUT)"
+fi
+# The two branches are separate `exec anvil` lines, so the state flags need
+# asserting on the pinned branch too, not just the tip one.
+if [[ "$RUN_OUT" == *"arg:--state
+arg:/data/state"* && "$RUN_OUT" == *"arg:--state-interval
+arg:60"* && "$RUN_OUT" == *"arg:--preserve-historical-states"* ]]; then
+  pass "pinned mode: --state /data/state --state-interval 60 --preserve-historical-states are passed"
+else
+  fail "pinned mode: state persistence flags are passed (got: $RUN_OUT)"
 fi
 
 # 3b. The values are read from the environment, not hard coded: a second chain

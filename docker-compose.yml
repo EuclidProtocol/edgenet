@@ -46,6 +46,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.anvil
+    volumes:
+      - ./data/84539:/data
     # BLOCK_TIME is whole seconds (anvil's -b flag). EVM_CHAIN_ID is Base
     # mainnet's real chain id (8453) with a digit inserted, a deliberate
     # offset so the fork does not collide with mainnet in wallets and
@@ -71,6 +73,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.anvil
+    volumes:
+      - ./data/50319:/data
     # BLOCK_TIME is whole seconds (anvil's -b flag). EVM_CHAIN_ID is Somnia
     # mainnet's real chain id (5031) with a digit inserted, a deliberate
     # offset so the fork does not collide with mainnet in wallets and
@@ -96,6 +100,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.anvil
+    volumes:
+      - ./data/1379:/data
     # BLOCK_TIME is whole seconds (anvil's -b flag). EVM_CHAIN_ID is Polygon
     # mainnet's real chain id (137) with a digit inserted, a deliberate
     # offset so the fork does not collide with mainnet in wallets and
