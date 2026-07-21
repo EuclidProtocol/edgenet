@@ -65,15 +65,14 @@ main() {
   # Persist chain state under the bind-mounted /data so it survives container
   # restarts. anvil loads /data/state on boot if present, dumps to it every
   # 300s and on exit. Memory previously grew unbounded because every mined
-  # block kept an in-memory state snapshot; --prune-history caps in-memory
-  # history to one hour of blocks, --max-persisted-states caps on-disk states
-  # at 16, and --transaction-block-keeper prunes mined transactions on the
-  # same one-hour horizon.
+  # block kept an in-memory state snapshot; --max-persisted-states caps on-disk
+  # states at 16, and --transaction-block-keeper prunes mined transactions on a
+  # one-hour horizon. --prune-history is intentionally omitted: anvil rejects it
+  # alongside --max-persisted-states.
   local HISTORY_BLOCKS=$((3600 / BLOCK_TIME))
   local STATE_FLAGS=(
     --state /data/state
     --state-interval 300
-    --prune-history "$HISTORY_BLOCKS"
     --max-persisted-states 16
     --transaction-block-keeper "$HISTORY_BLOCKS"
   )
