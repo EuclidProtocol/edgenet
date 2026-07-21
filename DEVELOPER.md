@@ -21,10 +21,21 @@ EVM chain either at the current chain tip or at a block height pinned in
 `.env`. Base listens on host port 8545, Somnia on 8546, Polygon on 8547;
 every container listens on 8545 internally.
 
-The two kinds differ only in role. All anvil services share one image and one
+**The faucet (`faucet`).** One service, built from `faucet/Dockerfile`. It is
+a Vite/React frontend built to `faucet/dist/` and an Express server
+(`faucet/server/index.mjs`) that serves that static build and answers
+`POST /api/faucet`, funding whichever address and chain the request names. It
+publishes host port 3000, both internally and externally, since unlike the
+anvil services it is not multiplied across chains. See section 7 for how it
+works.
+
+The three kinds differ only in role. All anvil services share one image and one
 script; they are distinguished purely by environment (`CHAIN_NAME`,
 `FORK_RPC_URL`, `FORK_BLOCK`, `BLOCK_TIME`, `EVM_CHAIN_ID`, `ANVIL_PORT`).
-There is no per chain Dockerfile and there should never be one.
+There is no per chain Dockerfile and there should never be one. The faucet is
+the only service that talks to every other service: it dials the Lumen node's
+RPC and every anvil fork's RPC, all by Compose service name over
+`edgenet-network`, exactly the way an external client would.
 
 Everything sits on the `edgenet-network` bridge network declared at the top of
 `docker-compose.yml`, so containers can reach each other by service name. All
@@ -52,6 +63,13 @@ implications:
   which can differ from the tip at the previous start.
 * If you ever add a consumer that needs the node's RPC to be live before it
   starts, you must add the ordering yourself. Do not assume it exists.
+* The `faucet` container is exactly such a consumer, and it has no ordering
+  guarantee either. It can start, and start serving `http://localhost:3000`,
+  before the Lumen node or any anvil fork is ready. Nothing prevents this; a
+  request that arrives too early simply fails against whichever upstream RPC
+  is not yet reachable, the same failure mode a request would hit against a
+  fork whose upstream RPC briefly drops, and there is no retry or queueing on
+  the faucet side to smooth it over.
 
 ## 2. `scripts/anvil-fork.sh`
 
@@ -69,7 +87,7 @@ under "Anvil forks".
 **1. Validate the environment.** `main()` calls `require_env` for `CHAIN_NAME`,
 `FORK_RPC_URL`, `ANVIL_PORT`, `BLOCK_TIME` and `EVM_CHAIN_ID`. `require_env`
 also rejects any of these values if it contains a literal quote character (see
-section 8), which matters because a quote surviving expansion silently
+section 9), which matters because a quote surviving expansion silently
 corrupts a URL built from it rather than failing loudly on its own.
 `BLOCK_TIME` and `EVM_CHAIN_ID` are then each checked against
 `^[1-9][0-9]*$`, the same positive integer regex `FORK_BLOCK` is held to
@@ -181,7 +199,7 @@ block time is well under a second, so `anvil-somnia` is configured with
 `BLOCK_TIME=1`, the smallest value anvil supports, and still ticks slower
 than the real chain. There is no anvil flag that accepts sub-second
 intervals, so this gap cannot be closed from this script; it is listed again
-as a known gap in section 7.
+as a known gap in section 8.
 
 ### Consequence: no automatic time alignment
 
@@ -203,7 +221,7 @@ script makes no HTTP calls and does not invoke `jq` at all; it only does a bash
 regex check and execs anvil. `Dockerfile.anvil` still installs `curl` and `jq`
 in the image (see section 5); whether that is intentional (kept for interactive
 debugging, e.g. via `docker exec`) or leftover from the removed resolver is not
-stated anywhere in the repository, and it is not this document's place to guess. See section 7.
+stated anywhere in the repository, and it is not this document's place to guess. See section 8.
 
 ## 3. Boot sequence: `scripts/edgenet.sh`
 
@@ -245,7 +263,7 @@ rest of the chain home.
    inside the container that holds it, so `rm -rf $CHAIN_HOME/` used to fail
    with `rm: can't remove '/lumend/.lumend': Resource busy` and, because the
    script runs under `set -e`, that killed the entrypoint on every boot (see
-   section 8 for the recovery steps if you hit this). The script now runs
+   section 9 for the recovery steps if you hit this). The script now runs
    `mkdir -p "$CHAIN_HOME"` followed by
    `find "$CHAIN_HOME" -mindepth 1 -maxdepth 1 -exec rm -rf {} +`, which clears
    everything under the mountpoint without touching the mountpoint itself.
@@ -312,11 +330,25 @@ rest of the chain home.
    `FUNDED_ACCOUNTS` funds only the validator; the script is careful not to
    emit a trailing comma in that case, which `in-place-testnet` would read as
    an empty address and reject.
-10. **Write the sentinel, then launch.** `touch "$CHAIN_HOME/initialized"` runs
+10. **Fund the faucet account, if configured.** `FAUCET_PRIVATE_KEY` (a raw
+    hex private key, no `0x` prefix, no quotes) is optional. If set, the
+    script imports it into a throwaway test keyring in a temp dir, purely to
+    derive its `euclid1...` address with `keys show`, then deletes that
+    keyring immediately, so the private key itself never lands anywhere in
+    `CHAIN_HOME`. The derived address is appended to `ACCOUNTS_TO_FUND`, the
+    same way `FUNDED_ACCOUNTS` was in step 9, so the faucet account ends up
+    funded like any other. A key that fails to import, or that somehow
+    derives no address, is fatal before `in-place-testnet` runs. Left empty,
+    this step is skipped entirely and `ACCOUNTS_TO_FUND` is unchanged; this
+    is the input the faucet's `server/index.mjs` reads back as
+    `FAUCET_PRIVATE_KEY` at request time to sign Lumen sends, see section 7.
+    `COSMWASM_ADMIN` is resolved right after, falling back to `$VAL_ACCOUNT`
+    if unset, so a bare `.env` still yields a usable testnet.
+11. **Write the sentinel, then launch.** `touch "$CHAIN_HOME/initialized"` runs
     immediately before `in-place-testnet`, not after, because there is no
     "after": `in-place-testnet` never returns, it converts the restored state
     and then runs the node itself. This is a deliberate, accepted tradeoff, not
-    an oversight, and it is listed as a known gap in section 7: a conversion
+    an oversight, and it is listed as a known gap in section 8: a conversion
     that dies partway through leaves the sentinel written over a
     half-converted home, and the next boot takes the resume path above and
     runs `start` against it. Recovery is `make clean` (or deleting the
@@ -327,7 +359,7 @@ rest of the chain home.
         --validator-pubkey=$CONSENSUS_PUBKEY \
         --validator-privkey=$CONSENSUS_PRIVKEY \
         --accounts-to-fund=$ACCOUNTS_TO_FUND \
-        --cosmwasm-admin=$VAL_ACCOUNT \
+        --cosmwasm-admin=$COSMWASM_ADMIN \
         --home $CHAIN_HOME \
         --coins-to-fund 1000000000000$DENOM,1000000000000$STAKE_DENOM
     ```
@@ -412,7 +444,7 @@ What it covers:
 * **`edgenet.sh` rejects a quoted `BINARY`** before any teardown of the chain
   home runs.
 * **`edgenet.sh` also fails safely when `HOME` itself is quoted** (the stale
-  image case, see section 8): it asserts the script exits non zero, that a
+  image case, see section 9): it asserts the script exits non zero, that a
   sentinel file placed inside the chain home survives (proving the
   entrypoint died before touching it), and that the error message points at
   rebuilding the image rather than editing `.env`.
@@ -440,7 +472,7 @@ copied across from the foundry stage. `scripts/anvil-fork.sh` is copied to
 `/usr/local/bin/` and set as the `ENTRYPOINT`.
 
 `jq` and `curl` are installed but, as of the current `scripts/anvil-fork.sh`,
-not used by it; see section 2 and the note in section 7. They may be there for
+not used by it; see section 2 and the note in section 8. They may be there for
 interactive debugging via `docker exec`, or simply left over from the removed
 resolver; the repository does not say which.
 
@@ -565,7 +597,83 @@ anvil-arbitrum-logs:
 No Dockerfile change, no script change. If you find yourself editing
 `Dockerfile.anvil` or `scripts/anvil-fork.sh` to add a chain, stop and reconsider.
 
-## 7. Known gaps and cleanup backlog
+## 7. Faucet
+
+`faucet/` is a small, separate npm project. `faucet/src/` (`App.tsx`,
+`main.tsx`, `index.css`) is a Vite/React single page frontend: pick a chain,
+enter an address, submit. `faucet/server/index.mjs` is the Express server;
+it is the only piece with any actual logic, and the only file this section
+documents in depth.
+
+### Build: two stage `faucet/Dockerfile`
+
+The build stage runs `npm ci` and `npm run build` (`tsc --noEmit && vite
+build`), producing `faucet/dist/`. The run stage installs only production
+dependencies (`npm ci --omit=dev`), copies `server/` and the built `dist/`
+across, and runs `node server/index.mjs`. The frontend is compiled once at
+image build time, not served by Vite's dev server at runtime; there is no
+`vite dev` in the running container.
+
+### What the server does
+
+`index.mjs` reads three sets of upstream RPC URLs from the environment:
+`LUMEN_RPC_URL` (default `http://edgenet:26657`) and `BASE_RPC_URL`,
+`SOMNIA_RPC_URL`, `POLYGON_RPC_URL` (defaulting to
+`http://anvil-base:8545`, `http://anvil-somnia:8545`,
+`http://anvil-polygon:8545`), the same Compose service names every other
+service already reaches its neighbours by. `docker-compose.yml` sets all
+four explicitly anyway; the defaults exist so the server also runs stand
+alone against a differently named stack.
+
+It serves the built frontend as static files from `dist/`, and answers one
+route, `POST /api/faucet`, with a JSON body of `{ chain, address }`.
+Behaviour branches on `chain`:
+
+* **`chain === "lumen"`.** The address must satisfy `fromBech32(address)`
+  with prefix `euclid`, or the request is rejected with 400. On success,
+  `fundLumen()` loads the faucet keypair from `FAUCET_PRIVATE_KEY` with
+  `DirectSecp256k1Wallet.fromKey(fromHex(pk), "euclid")`, opens a
+  `SigningStargateClient` against `LUMEN_RPC_URL`, and calls `sendTokens()`
+  for `1000000000ualpha` and `1000000000usync` (1,000 of each denom, at 6
+  decimals) to the requested address, gas priced at `0.015ualpha`. The
+  response is the real `transactionHash`. If `FAUCET_PRIVATE_KEY` is unset,
+  `fundLumen()` throws `FAUCET_PRIVATE_KEY not set` before it ever tries to
+  build a wallet, and the route answers 500 with that message.
+* **`chain === "base" | "somnia" | "polygon"`.** The address must match
+  `/^0x[0-9a-fA-F]{40}$/`, or the request is rejected with 400. On success,
+  `fundEvm()` reads the address's current balance with `eth_getBalance`,
+  adds `1000` ether (`1000n * 10n ** 18n`, matching the 18 decimal native
+  token every anvil fork uses), and writes the new balance back with
+  `anvil_setBalance`. This is a state cheat the anvil JSON-RPC exposes for
+  exactly this purpose, not a signed transaction, so there is no sender, no
+  gas, and no real transaction hash; the route returns the hash of the
+  latest block instead, purely as an acknowledgement that the call reached
+  the fork.
+* **Any other `chain` value.** Rejected with 400, `unknown chain`.
+
+There is no authentication and no rate limiting anywhere in this route: any
+caller, on any chain, can request any address be funded any number of times.
+This is deliberate for a local development faucet behind no public ingress,
+not an oversight; if the stack is ever exposed beyond a developer's own
+machine, this is the first thing to add.
+
+### Where the Lumen faucet account gets its initial balance
+
+The faucet server never funds its own account; it only spends from it. The
+account is funded once, at the Lumen node's first boot, by
+`scripts/edgenet.sh`, not by anything in `faucet/`. See section 3, the
+`FAUCET_PRIVATE_KEY` step: the script imports the raw hex key into a
+throwaway keyring purely to derive the `euclid1...` address, appends that
+address to `--accounts-to-fund`, and the account receives
+`1000000000000ualpha` and `1000000000000usync` (1,000,000 of each denom)
+from `in-place-testnet`, the same funding every other funded account gets.
+If `FAUCET_PRIVATE_KEY` is empty, no faucet account is created or funded,
+and the `lumen` tab has nothing to sign from until it is set and the node is
+rebuilt from scratch (the account is only created on the build path, see
+section 3; an already initialized chain home ignores a newly set
+`FAUCET_PRIVATE_KEY` exactly the way it ignores a changed `SNAPSHOT_URL`).
+
+## 8. Known gaps and cleanup backlog
 
 None of these are blocking. All of them are real.
 
@@ -595,7 +703,7 @@ None of these are blocking. All of them are real.
   turns the binary download URL into nonsense). A guard target that checks for
   the file and errors with a useful message would be a real improvement. The
   `Makefile` no longer parses or exports `.env` itself, which is what used to
-  turn this from a late failure into a corrupted one (see section 8).
+  turn this from a late failure into a corrupted one (see section 9).
 * **`.gitignore` has stale entries.** It ignores `logs/` and `*.log`, but nothing
   in the repository writes to either. Logs go to the Docker daemon and are read
   back with `docker compose logs`.
@@ -635,7 +743,7 @@ None of these are blocking. All of them are real.
   scratch, which incidentally self-healed this class of failure. There is no
   automatic detection of a broken home; the recovery is manual, `make clean`.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 ### Recovering from quote poisoned `.env` values
 

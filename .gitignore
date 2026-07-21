@@ -5,3 +5,5 @@ data/
 logs/
 *.log
 .DS_Store
+node_modules/
+faucet/dist/

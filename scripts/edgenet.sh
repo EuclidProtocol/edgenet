@@ -14,7 +14,7 @@ STAKE_DENOM="${STAKE_DENOM:-usync}"
 # The check is only about quote characters, so an empty value passes it: that
 # matters for FUNDED_ACCOUNTS, which is legitimately empty when no extra
 # development accounts are configured.
-for var in BINARY CHAIN_ID DENOM STAKE_DENOM SNAPSHOT_URL FUNDED_ACCOUNTS COSMWASM_ADMIN; do
+for var in BINARY CHAIN_ID DENOM STAKE_DENOM SNAPSHOT_URL FUNDED_ACCOUNTS COSMWASM_ADMIN FAUCET_PRIVATE_KEY; do
     value="${!var:-}"
     case "$value" in
         *\"*|*\'*)
@@ -226,6 +226,28 @@ fi
 ACCOUNTS_TO_FUND=$VAL_ACCOUNT
 if [ -n "${FUNDED_ACCOUNTS:-}" ]; then
     ACCOUNTS_TO_FUND=$ACCOUNTS_TO_FUND,$FUNDED_ACCOUNTS
+fi
+
+# FAUCET_PRIVATE_KEY (raw hex, may be empty) funds a faucet account on top of the
+# above. The chain only knows bech32 addresses, so the hex key is imported into a
+# throwaway test keyring in a temp dir purely to derive its euclid1... address; the
+# keyring is deleted right after so the key never lands in the chain home. Empty
+# value leaves ACCOUNTS_TO_FUND untouched (current behavior).
+if [ -n "${FAUCET_PRIVATE_KEY:-}" ]; then
+    FAUCET_KEYRING=$(mktemp -d)
+    if ! $BINARY keys import-hex faucet-tmp "$FAUCET_PRIVATE_KEY" --keyring-backend test --home "$FAUCET_KEYRING"; then
+        echo "FATAL: could not import FAUCET_PRIVATE_KEY as a hex key." >&2
+        echo "       Expected a raw hex private key (no 0x prefix, no surrounding quotes)." >&2
+        rm -rf "$FAUCET_KEYRING"
+        exit 1
+    fi
+    FAUCET_ACCOUNT=$($BINARY keys show faucet-tmp -a --keyring-backend test --home "$FAUCET_KEYRING")
+    rm -rf "$FAUCET_KEYRING"
+    if [ -z "$FAUCET_ACCOUNT" ]; then
+        echo "FATAL: could not derive an address from FAUCET_PRIVATE_KEY." >&2
+        exit 1
+    fi
+    ACCOUNTS_TO_FUND=$ACCOUNTS_TO_FUND,$FAUCET_ACCOUNT
 fi
 
 # The cosmwasm admin defaults to the validator account so a bare .env still

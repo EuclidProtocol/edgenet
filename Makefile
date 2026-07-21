@@ -4,7 +4,8 @@ COMPOSE := DOCKER_BUILDKIT=1 docker compose --profile edgenet
 .PHONY: edgenet edgenet-up edgenet-stop edgenet-down edgenet-logs build build-force rebuild clean \
 	node-start node-startd node-stop node-logs \
 	anvil-base-start anvil-base-stop anvil-base-logs \
-	anvil-somnia-start anvil-somnia-stop anvil-somnia-logs
+	anvil-somnia-start anvil-somnia-stop anvil-somnia-logs \
+	faucet-start faucet-stop faucet-logs
 
 # ──────────────────────────────────────────────────────────────
 # Single entrypoint: Lumen edgenet node + all anvil forks
@@ -100,6 +101,19 @@ anvil-polygon-stop:
 
 anvil-polygon-logs:
 	@$(COMPOSE) logs -f anvil-polygon --since 10s
+
+# ──────────────────────────────────────────────────────────────
+# Faucet
+# ──────────────────────────────────────────────────────────────
+
+faucet-start:
+	@$(COMPOSE) up -d --build faucet
+
+faucet-stop:
+	@$(COMPOSE) stop faucet
+
+faucet-logs:
+	@$(COMPOSE) logs -f faucet --since 10s
 
 # ──────────────────────────────────────────────────────────────
 # Housekeeping
