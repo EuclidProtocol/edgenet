@@ -53,6 +53,37 @@ async function fundEvm(url, address) {
   );
 }
 
+// Anvil resumes a persisted state's own clock after a restart, so a fork
+// that was down for hours comes back with its chain time lagging wall-clock
+// by the same amount. Syncing mines one block stamped "now"; block-time
+// mining then derives every later timestamp from it, so a single corrective
+// block is enough. Timestamps only ratchet forward, hence the lag threshold:
+// evm_setNextBlockTimestamp rejects a timestamp at or below the current tip.
+const CLOCK_SYNC_LAG_THRESHOLD = 30; // seconds
+const CLOCK_SYNC_INTERVAL =
+  Number(process.env.CLOCK_SYNC_INTERVAL_SECONDS ?? 600); // 0 disables
+
+async function syncClock(chain, url) {
+  const block = await rpc(url, "eth_getBlockByNumber", ["latest", false]);
+  const now = Math.floor(Date.now() / 1000);
+  const lag = now - Number(BigInt(block.timestamp));
+  if (lag <= CLOCK_SYNC_LAG_THRESHOLD) return { chain, lag, synced: false };
+  await rpc(url, "evm_setNextBlockTimestamp", [now]);
+  await rpc(url, "evm_mine", []);
+  return { chain, lag, synced: true };
+}
+
+async function syncAllClocks() {
+  return Promise.all(
+    Object.entries(EVM_CHAINS).map(([chain, url]) =>
+      syncClock(chain, url).catch((err) => ({
+        chain,
+        error: String(err.message || err),
+      }))
+    )
+  );
+}
+
 async function fundLumen(address) {
   const pk = process.env.FAUCET_PRIVATE_KEY;
   if (!pk) throw new Error("FAUCET_PRIVATE_KEY not set");
@@ -92,6 +123,27 @@ app.post("/api/faucet", async (req, res) => {
   }
 });
 
+app.post("/api/sync-time", async (_req, res) => {
+  res.json({ results: await syncAllClocks() });
+});
+
 app.use(express.static(join(__dirname, "..", "dist")));
+
+if (CLOCK_SYNC_INTERVAL > 0) {
+  setInterval(() => {
+    syncAllClocks().then((results) => {
+      const synced = results.filter((r) => r.synced);
+      if (synced.length)
+        console.log(
+          `clock sync: ${synced.map((r) => `${r.chain} (+${r.lag}s)`).join(", ")}`
+        );
+      const failed = results.filter((r) => r.error);
+      if (failed.length)
+        console.error(
+          `clock sync failed: ${failed.map((r) => `${r.chain}: ${r.error}`).join("; ")}`
+        );
+    });
+  }, CLOCK_SYNC_INTERVAL * 1000);
+}
 
 app.listen(PORT, () => console.log(`faucet listening on :${PORT}`));

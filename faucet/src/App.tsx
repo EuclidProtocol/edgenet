@@ -9,11 +9,45 @@ const CHAINS = [
 
 type Result = { ok: boolean; text: string };
 
+type SyncResult = {
+  chain: string;
+  lag?: number;
+  synced?: boolean;
+  error?: string;
+};
+
 export default function App() {
   const [chain, setChain] = useState("lumen");
   const [address, setAddress] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<Result | null>(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<Result | null>(null);
+
+  async function syncTime() {
+    setSyncing(true);
+    setSyncResult(null);
+    try {
+      const res = await fetch("/api/sync-time", { method: "POST" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Request failed");
+      const text = (data.results as SyncResult[])
+        .map((r) =>
+          r.error
+            ? `${r.chain}: failed (${r.error})`
+            : r.synced
+              ? `${r.chain}: synced (was ${r.lag}s behind)`
+              : `${r.chain}: already in sync (${r.lag}s)`
+        )
+        .join(" · ");
+      const ok = (data.results as SyncResult[]).every((r) => !r.error);
+      setSyncResult({ ok, text });
+    } catch (err) {
+      setSyncResult({ ok: false, text: String(err) });
+    } finally {
+      setSyncing(false);
+    }
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -68,6 +102,21 @@ export default function App() {
 
       {result && (
         <div className={`result ${result.ok ? "ok" : "err"}`}>{result.text}</div>
+      )}
+
+      <div className="sync">
+        <button type="button" className="secondary" onClick={syncTime} disabled={syncing}>
+          {syncing ? "Syncing..." : "Sync fork clocks"}
+        </button>
+        <p className="sub">
+          Set the EVM forks' chain time to the current wall-clock time.
+        </p>
+      </div>
+
+      {syncResult && (
+        <div className={`result ${syncResult.ok ? "ok" : "err"}`}>
+          {syncResult.text}
+        </div>
       )}
     </div>
   );
