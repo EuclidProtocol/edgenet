@@ -57,7 +57,7 @@ services:
       - CHAIN_NAME=base
       - FORK_RPC_URL=${BASE_FORK_RPC_URL}
       - FORK_BLOCK=${BASE_FORK_BLOCK}
-      - BLOCK_TIME=2
+      - BLOCK_TIME=5
       - EVM_CHAIN_ID=84539
       - ANVIL_PORT=8545
     ports:
@@ -84,7 +84,7 @@ services:
       - CHAIN_NAME=somnia
       - FORK_RPC_URL=${SOMNIA_FORK_RPC_URL}
       - FORK_BLOCK=${SOMNIA_FORK_BLOCK}
-      - BLOCK_TIME=1
+      - BLOCK_TIME=5
       - EVM_CHAIN_ID=50319
       - ANVIL_PORT=8545
     ports:
@@ -111,7 +111,7 @@ services:
       - CHAIN_NAME=polygon
       - FORK_RPC_URL=${POLYGON_FORK_RPC_URL}
       - FORK_BLOCK=${POLYGON_FORK_BLOCK}
-      - BLOCK_TIME=2
+      - BLOCK_TIME=5
       - EVM_CHAIN_ID=1379
       - ANVIL_PORT=8545
     ports:

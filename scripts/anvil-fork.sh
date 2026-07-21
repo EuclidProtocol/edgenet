@@ -26,6 +26,11 @@
 # forked block's original timestamp. On a restart that reloads persisted
 # /data/state, this flag is a no-op: anvil resumes the state's own clock,
 # it does not rewind to a fresh --timestamp.
+#
+# History is bounded. Unpruned, every mined block keeps an in-memory state
+# snapshot and memory grows without limit; instead anvil keeps one hour of
+# blocks in memory, at most 16 states on disk, and dumps state to /data
+# every 300 seconds.
 
 set -euo pipefail
 
@@ -58,13 +63,19 @@ main() {
     || die "EVM_CHAIN_ID must be a positive integer chain id, got '$EVM_CHAIN_ID'"
 
   # Persist chain state under the bind-mounted /data so it survives container
-  # restarts. anvil loads /data/state on boot if present, dumps to it every 60s
-  # and on exit; --preserve-historical-states keeps the per-block snapshots the
-  # fork accumulates so a reload restores history, not just the latest state.
+  # restarts. anvil loads /data/state on boot if present, dumps to it every
+  # 300s and on exit. Memory previously grew unbounded because every mined
+  # block kept an in-memory state snapshot; --prune-history caps in-memory
+  # history to one hour of blocks, --max-persisted-states caps on-disk states
+  # at 16, and --transaction-block-keeper prunes mined transactions on the
+  # same one-hour horizon.
+  local HISTORY_BLOCKS=$((3600 / BLOCK_TIME))
   local STATE_FLAGS=(
     --state /data/state
-    --state-interval 60
-    --preserve-historical-states
+    --state-interval 300
+    --prune-history "$HISTORY_BLOCKS"
+    --max-persisted-states 16
+    --transaction-block-keeper "$HISTORY_BLOCKS"
   )
 
   # Wall-clock unix time, not the forked chain's own timestamp: a fork of an

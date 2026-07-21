@@ -111,11 +111,16 @@ else
   fail "tip mode: --timestamp is passed as the current unix time (got: '$ts', now=$now)"
 fi
 # State persistence flags must reach anvil so the chain survives restarts. The
-# path is the container side of the per-fork /data bind mount.
+# path is the container side of the per-fork /data bind mount. History is
+# bounded to one hour of blocks: --prune-history and --transaction-block-keeper
+# are 3600 / BLOCK_TIME (1800 at BLOCK_TIME=2), not a hard-coded count.
 if [[ "$RUN_OUT" == *"arg:--state
 arg:/data/state"* && "$RUN_OUT" == *"arg:--state-interval
-arg:60"* && "$RUN_OUT" == *"arg:--preserve-historical-states"* ]]; then
-  pass "tip mode: --state /data/state --state-interval 60 --preserve-historical-states are passed"
+arg:300"* && "$RUN_OUT" == *"arg:--prune-history
+arg:1800"* && "$RUN_OUT" == *"arg:--max-persisted-states
+arg:16"* && "$RUN_OUT" == *"arg:--transaction-block-keeper
+arg:1800"* ]]; then
+  pass "tip mode: --state /data/state --state-interval 300 --prune-history 1800 --max-persisted-states 16 --transaction-block-keeper 1800 are passed"
 else
   fail "tip mode: state persistence flags are passed (got: $RUN_OUT)"
 fi
@@ -178,8 +183,11 @@ fi
 # asserting on the pinned branch too, not just the tip one.
 if [[ "$RUN_OUT" == *"arg:--state
 arg:/data/state"* && "$RUN_OUT" == *"arg:--state-interval
-arg:60"* && "$RUN_OUT" == *"arg:--preserve-historical-states"* ]]; then
-  pass "pinned mode: --state /data/state --state-interval 60 --preserve-historical-states are passed"
+arg:300"* && "$RUN_OUT" == *"arg:--prune-history
+arg:1800"* && "$RUN_OUT" == *"arg:--max-persisted-states
+arg:16"* && "$RUN_OUT" == *"arg:--transaction-block-keeper
+arg:1800"* ]]; then
+  pass "pinned mode: --state /data/state --state-interval 300 --prune-history 1800 --max-persisted-states 16 --transaction-block-keeper 1800 are passed"
 else
   fail "pinned mode: state persistence flags are passed (got: $RUN_OUT)"
 fi
