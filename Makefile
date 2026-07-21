@@ -121,4 +121,4 @@ faucet-logs:
 
 # Remove chain data (the snapshot cache in cache/ is kept)
 clean:
-	@rm -rf .config
+	@rm -rf data
